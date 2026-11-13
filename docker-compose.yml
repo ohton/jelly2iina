@@ -1,0 +1,17 @@
+services:
+  jellyfin-iina-bridge:
+    build: .
+    container_name: jellyfin-iina-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - JELLYFIN_URL=${JELLYFIN_URL:-http://localhost:8096}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
+    ports:
+      - "8095:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./app.py:/app/app.py
+      - /Volumes:/Volumes:ro
