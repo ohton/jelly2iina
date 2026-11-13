@@ -1,4 +1,5 @@
 import os
+import re
 import urllib.parse
 import base64
 import asyncio
@@ -104,6 +105,38 @@ def build_mpv_url(item_id: str) -> str:
 detected_server_os: str = "linux"
 last_server_os_fetch: float = 0.0
 
+# ユーザーID管理 (環境変数指定または自動検出)
+JELLYFIN_USER_ID_ENV = os.getenv("JELLYFIN_USER_ID", "").strip()
+cached_user_id: Optional[str] = None
+last_user_id_fetch: float = 0.0
+
+async def get_current_user_id() -> Optional[str]:
+    global cached_user_id, last_user_id_fetch
+    if JELLYFIN_USER_ID_ENV:
+        return JELLYFIN_USER_ID_ENV
+    now = time.time()
+    if cached_user_id and (now - last_user_id_fetch < 600):
+        return cached_user_id
+
+    headers = get_auth_headers()
+    try:
+        res = await http_client.get(f"{JELLYFIN_URL}/Users", headers=headers)
+        if res.status_code == 200:
+            users = res.json()
+            for u in users:
+                if u.get("Policy", {}).get("IsAdministrator"):
+                    cached_user_id = u.get("Id")
+                    last_user_id_fetch = now
+                    return cached_user_id
+            if users:
+                cached_user_id = users[0].get("Id")
+                last_user_id_fetch = now
+                return cached_user_id
+    except Exception:
+        pass
+
+    return None
+
 async def detect_server_os() -> str:
     global detected_server_os, last_server_os_fetch
     now = time.time()
@@ -198,12 +231,16 @@ async def get_item_image(item_id: str, max_width: int = 400):
         return Response(content=SVG_PLACEHOLDER, media_type="image/svg+xml")
 
 SORT_CONFIG = {
+    "user_rating_desc": ("Rating", "Descending"),
+    "user_rating_asc": ("Rating", "Ascending"),
     "premiere_desc": ("PremiereDate,DateCreated", "Descending"),
     "premiere_asc": ("PremiereDate,DateCreated", "Ascending"),
     "date_desc": ("DateCreated", "Descending"),
     "date_asc": ("DateCreated", "Ascending"),
     "rating_desc": ("CommunityRating", "Descending"),
     "rating_asc": ("CommunityRating", "Ascending"),
+    "filename_asc": ("SortName", "Ascending"),
+    "filename_desc": ("SortName", "Descending"),
     "name_asc": ("SortName", "Ascending"),
     "name_desc": ("SortName", "Descending"),
     "random": ("Random", "Ascending"),
@@ -225,8 +262,9 @@ async def search_items(
     sort_field, sort_order = SORT_CONFIG.get(sort, ("PremiereDate,DateCreated", "Descending"))
     headers = get_auth_headers()
     server_os = await detect_server_os()
+    user_id = await get_current_user_id()
 
-    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People"
+    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData"
 
     try:
         if q and q.strip():
@@ -237,36 +275,38 @@ async def search_items(
                 "includeItemTypes": "Movie,Episode,Video",
                 "fields": base_fields,
             }
+            if user_id:
+                base_params["userId"] = user_id
 
             tasks = [
-                # 1. 通常のアイテム検索
+                # 1. 通常のアイテム検索 (上限を大きく拡大)
                 http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "searchTerm": search_term, "limit": 200},
+                    params={**base_params, "searchTerm": search_term, "limit": 2000},
                     headers=headers
                 ),
                 # 2. シリーズ (Series) 自体の検索
                 http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": search_term, "limit": 20},
+                    params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": search_term, "limit": 50},
                     headers=headers
                 ),
                 # 3. 出演者検索
                 http_client.get(
                     f"{JELLYFIN_URL}/Persons",
-                    params={"searchTerm": search_term, "limit": 10},
+                    params={"searchTerm": search_term, "limit": 30},
                     headers=headers
                 ),
                 # 4. ジャンル検索
                 http_client.get(
                     f"{JELLYFIN_URL}/Genres",
-                    params={"searchTerm": search_term, "limit": 5},
+                    params={"searchTerm": search_term, "limit": 20},
                     headers=headers
                 ),
                 # 5. スタジオ検索
                 http_client.get(
                     f"{JELLYFIN_URL}/Studios",
-                    params={"searchTerm": search_term, "limit": 10},
+                    params={"searchTerm": search_term, "limit": 30},
                     headers=headers
                 ),
                 # 6. タグ一覧取得
@@ -311,11 +351,16 @@ async def search_items(
                         matched_tags.append(tag)
 
             extra_tasks = []
+            # シリーズエピソードは話数上限を設けない（全エピソード漏れなく取得）
+            episode_params = {"fields": base_fields}
+            if user_id:
+                episode_params["userId"] = user_id
+
             for sid in series_ids:
                 extra_tasks.append(
                     http_client.get(
                         f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
-                        params={"fields": base_fields, "limit": 200},
+                        params=episode_params,
                         headers=headers
                     )
                 )
@@ -324,7 +369,7 @@ async def search_items(
                 extra_tasks.append(
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "personIds": ",".join(person_ids), "limit": 200},
+                        params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
                         headers=headers
                     )
                 )
@@ -332,7 +377,7 @@ async def search_items(
                 extra_tasks.append(
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "genreIds": ",".join(genre_ids), "limit": 200},
+                        params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
                         headers=headers
                     )
                 )
@@ -340,7 +385,7 @@ async def search_items(
                 extra_tasks.append(
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "studioIds": ",".join(studio_ids), "limit": 200},
+                        params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
                         headers=headers
                     )
                 )
@@ -348,7 +393,7 @@ async def search_items(
                 extra_tasks.append(
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "tags": "|".join(matched_tags[:10]), "limit": 200},
+                        params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
                         headers=headers
                     )
                 )
@@ -363,14 +408,42 @@ async def search_items(
 
             all_items = list(items_map.values())
 
-            def get_name_sort_key(x):
-                if x.get("Type") == "Episode" and x.get("SeriesName"):
-                    s_idx = x.get("ParentIndexNumber") or 0
-                    e_idx = x.get("IndexNumber") or 0
-                    return f"{x.get('SeriesName')} {s_idx:04d} {e_idx:04d}".lower()
-                return (x.get("SortName") or x.get("Name") or "").lower()
+            def natural_sort_key(s: str):
+                return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s or "")]
 
-            if sort == "premiere_desc":
+            def get_name_sort_key(x):
+                # エピソードでも単体動画でも、動画のタイトル名そのもので自然順ソート
+                return natural_sort_key(x.get("Name") or x.get("SortName") or "")
+
+            def get_filename_sort_key(x):
+                path = x.get("Path", "")
+                if not path:
+                    media_sources = x.get("MediaSources", [])
+                    if media_sources and "Path" in media_sources[0]:
+                        path = media_sources[0]["Path"]
+                fname = path.replace("\\", "/").split("/")[-1] if path else ""
+                if not fname:
+                    fname = x.get("Name") or x.get("SortName") or ""
+                return natural_sort_key(fname)
+
+            if sort == "user_rating_desc":
+                all_items.sort(
+                    key=lambda x: (
+                        (x.get("UserData") or {}).get("Rating")
+                        if (x.get("UserData") or {}).get("Rating") is not None
+                        else -1.0
+                    ),
+                    reverse=True
+                )
+            elif sort == "user_rating_asc":
+                all_items.sort(
+                    key=lambda x: (
+                        (x.get("UserData") or {}).get("Rating")
+                        if (x.get("UserData") or {}).get("Rating") is not None
+                        else 999.0
+                    )
+                )
+            elif sort == "premiere_desc":
                 all_items.sort(
                     key=lambda x: (
                         1 if x.get("PremiereDate") else 0,
@@ -395,6 +468,10 @@ async def search_items(
                 all_items.sort(key=lambda x: (x.get("CommunityRating") if x.get("CommunityRating") is not None else -1.0), reverse=True)
             elif sort == "rating_asc":
                 all_items.sort(key=lambda x: (x.get("CommunityRating") if x.get("CommunityRating") is not None else 999.0))
+            elif sort == "filename_asc":
+                all_items.sort(key=get_filename_sort_key)
+            elif sort == "filename_desc":
+                all_items.sort(key=get_filename_sort_key, reverse=True)
             elif sort == "name_asc":
                 all_items.sort(key=get_name_sort_key)
             elif sort == "name_desc":
@@ -416,6 +493,8 @@ async def search_items(
                 "limit": limit,
                 "startIndex": startIndex,
             }
+            if user_id:
+                params["userId"] = user_id
             res = await http_client.get(f"{JELLYFIN_URL}/Items", params=params, headers=headers)
             if res.status_code == 401:
                 raise HTTPException(status_code=401, detail="Invalid Jellyfin API Key")
@@ -440,6 +519,8 @@ async def search_items(
             runtime_ticks = it.get("RunTimeTicks")
             has_primary_image = bool(it.get("ImageTags", {}).get("Primary"))
             rating = it.get("CommunityRating")
+            user_data = it.get("UserData") or {}
+            user_rating = user_data.get("Rating")
             tags = it.get("Tags", []) or []
             studios = [s.get("Name") for s in it.get("Studios", []) if s.get("Name")]
 
@@ -487,6 +568,7 @@ async def search_items(
                 "has_image": has_primary_image,
                 "runtime": format_runtime(runtime_ticks),
                 "rating": round(rating, 1) if rating is not None else None,
+                "user_rating": round(user_rating, 1) if user_rating is not None else None,
                 "premiere_date": it.get("PremiereDate", "")[:10] if it.get("PremiereDate") else "",
                 "tags": tags[:12],
                 "actors": actors[:8],
@@ -507,6 +589,8 @@ async def search_items(
 class MetadataUpdateRequest(BaseModel):
     community_rating: Optional[float] = None
     clear_rating: Optional[bool] = False
+    user_rating: Optional[float] = None
+    clear_user_rating: Optional[bool] = False
     name: Optional[str] = None
     overview: Optional[str] = None
     tags: Optional[List[str]] = None
@@ -519,11 +603,20 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         raise HTTPException(status_code=401, detail="API Key not configured")
 
     headers = get_auth_headers()
+    user_id = await get_current_user_id()
+
     # 1. 現在のアイテムオブジェクトを取得
     try:
+        fetch_params = {
+            "ids": item_id,
+            "fields": "CommunityRating,Tags,Overview,Genres,Studios,PremiereDate,ProductionYear,UserData",
+        }
+        if user_id:
+            fetch_params["userId"] = user_id
+
         res = await http_client.get(
             f"{JELLYFIN_URL}/Items",
-            params={"ids": item_id, "fields": "CommunityRating,Tags,Overview,Genres,Studios,PremiereDate,ProductionYear"},
+            params=fetch_params,
             headers=headers
         )
         if res.status_code != 200:
@@ -573,7 +666,7 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             item_dto["PremiereDate"] = None
             item_dto["ProductionYear"] = None
 
-    # 3. Jellyfin へ送信
+    # 3. Jellyfin へメタデータを送信 (Item更新)
     try:
         post_headers = {**headers, "Content-Type": "application/json"}
         update_res = await http_client.post(
@@ -583,6 +676,33 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         )
         if update_res.status_code not in (200, 204):
             raise HTTPException(status_code=update_res.status_code, detail=f"Jellyfin update error: {update_res.text}")
+
+        # 4. 個人評価 (UserData.Rating) の更新
+        updated_user_rating = (item_dto.get("UserData") or {}).get("Rating")
+        if user_id:
+            if payload.clear_user_rating:
+                try:
+                    await http_client.delete(
+                        f"{JELLYFIN_URL}/UserItems/{item_id}/Rating",
+                        params={"userId": user_id},
+                        headers=headers
+                    )
+                    updated_user_rating = None
+                except Exception:
+                    pass
+            elif payload.user_rating is not None:
+                val = round(payload.user_rating, 1)
+                try:
+                    user_key = (item_dto.get("UserData") or {}).get("Key") or item_id
+                    await http_client.post(
+                        f"{JELLYFIN_URL}/UserItems/{item_id}/UserData",
+                        params={"userId": user_id},
+                        json={"Rating": val, "Key": user_key},
+                        headers=post_headers
+                    )
+                    updated_user_rating = val
+                except Exception:
+                    pass
 
         premiere_date_str = item_dto.get("PremiereDate", "")
         if premiere_date_str:
@@ -594,12 +714,15 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             "status": "ok",
             "id": item_id,
             "rating": item_dto.get("CommunityRating"),
+            "user_rating": updated_user_rating,
             "name": item_dto.get("Name"),
             "tags": item_dto.get("Tags", []),
             "overview": item_dto.get("Overview", ""),
             "premiere_date": premiere_date_str,
             "year": item_dto.get("ProductionYear"),
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
 
@@ -1017,24 +1140,27 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       position: absolute;
       top: 0.5rem;
       left: 0.5rem;
-      background: rgba(0, 0, 0, 0.75);
-      color: var(--accent-star);
-      font-size: 0.75rem;
+      background: rgba(10, 14, 23, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #fff;
+      font-size: 0.72rem;
       font-weight: 700;
-      padding: 0.2rem 0.5rem;
-      border-radius: 4px;
-      backdrop-filter: blur(4px);
+      padding: 0.22rem 0.45rem;
+      border-radius: 6px;
+      backdrop-filter: blur(6px);
       display: flex;
       align-items: center;
-      gap: 0.2rem;
+      gap: 0.35rem;
       cursor: pointer;
       transition: var(--transition);
+      letter-spacing: 0.02em;
     }
 
     .card-rating:hover {
-      background: rgba(0, 0, 0, 0.95);
-      transform: scale(1.05);
-      box-shadow: 0 0 10px rgba(251, 191, 36, 0.4);
+      background: rgba(10, 14, 23, 0.96);
+      border-color: rgba(244, 114, 182, 0.5);
+      transform: scale(1.04);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5), 0 0 10px rgba(244, 114, 182, 0.25);
     }
 
     .card-edit-btn {
@@ -1336,17 +1462,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: var(--bg-card);
       border: 1px solid var(--border-color);
       border-radius: 16px;
-      max-width: 580px;
+      max-width: 660px;
       width: 100%;
-      max-height: 90vh;
+      max-height: 92vh;
       overflow-y: auto;
-      padding: 1.75rem;
+      padding: 1.25rem 1.5rem;
       box-shadow: 0 20px 40px rgba(0, 0, 0, 0.7);
       transform: translateY(20px);
       transition: all 0.25s ease;
       display: flex;
       flex-direction: column;
-      gap: 1.25rem;
+      gap: 0.85rem;
     }
 
     .modal-backdrop.open .modal-content {
@@ -1358,11 +1484,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       border-bottom: 1px solid var(--border-color);
-      padding-bottom: 0.75rem;
+      padding-bottom: 0.6rem;
     }
 
     .modal-title {
-      font-size: 1.2rem;
+      font-size: 1.15rem;
       font-weight: 700;
       display: flex;
       align-items: center;
@@ -1373,9 +1499,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: none;
       border: none;
       color: var(--text-muted);
-      font-size: 1.4rem;
+      font-size: 1.3rem;
       cursor: pointer;
-      padding: 0.2rem 0.5rem;
+      padding: 0.15rem 0.45rem;
       border-radius: 6px;
       transition: var(--transition);
     }
@@ -1385,14 +1511,26 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: #273043;
     }
 
+    .ratings-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 620px) {
+      .ratings-row {
+        grid-template-columns: 1fr;
+      }
+    }
+
     .form-group {
       display: flex;
       flex-direction: column;
-      gap: 0.5rem;
+      gap: 0.35rem;
     }
 
     .form-label {
-      font-size: 0.88rem;
+      font-size: 0.84rem;
       font-weight: 600;
       color: var(--text-muted);
       display: flex;
@@ -1401,7 +1539,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     .form-label-hint {
-      font-size: 0.75rem;
+      font-size: 0.72rem;
       color: var(--text-sub);
       font-weight: normal;
     }
@@ -1411,9 +1549,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
       color: var(--text-main);
       color-scheme: dark;
-      padding: 0.65rem 0.9rem;
+      padding: 0.55rem 0.8rem;
       border-radius: 8px;
-      font-size: 0.95rem;
+      font-size: 0.9rem;
       outline: none;
       transition: var(--transition);
     }
@@ -1425,8 +1563,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     .form-textarea {
       resize: vertical;
-      min-height: 80px;
-      line-height: 1.5;
+      min-height: 60px;
+      line-height: 1.4;
     }
 
     /* Rating Input Controls */
@@ -1434,10 +1572,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: #0e1117;
       border: 1px solid var(--border-color);
       border-radius: 10px;
-      padding: 1rem;
+      padding: 0.65rem 0.85rem;
       display: flex;
       flex-direction: column;
-      gap: 0.75rem;
+      gap: 0.45rem;
     }
 
     .rating-header-row {
@@ -1447,17 +1585,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     .rating-display-val {
-      font-size: 1.5rem;
+      font-size: 1.25rem;
       font-weight: 800;
       color: var(--accent-star);
       display: flex;
       align-items: center;
-      gap: 0.3rem;
+      gap: 0.25rem;
     }
 
     .rating-presets {
       display: flex;
-      gap: 0.4rem;
+      gap: 0.25rem;
       flex-wrap: wrap;
     }
 
@@ -1465,9 +1603,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: #1c2230;
       border: 1px solid var(--border-color);
       color: var(--text-main);
-      padding: 0.25rem 0.6rem;
-      border-radius: 6px;
-      font-size: 0.8rem;
+      padding: 0.18rem 0.45rem;
+      border-radius: 5px;
+      font-size: 0.75rem;
       font-weight: 600;
       cursor: pointer;
       transition: var(--transition);
@@ -1587,7 +1725,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <option value="premiere_asc">📅 公開日 (古い順)</option>
           <option value="date_desc">🕒 追加日 (新しい順)</option>
           <option value="date_asc">⏳ 追加日 (古い順)</option>
+          <option value="user_rating_desc">💕 個人評価 (高い順)</option>
+          <option value="user_rating_asc">💕 個人評価 (低い順)</option>
           <option value="rating_desc">⭐ コミュニティ評価 (高い順)</option>
+          <option value="rating_asc">⭐ コミュニティ評価 (低い順)</option>
+          <option value="filename_asc">📁 ファイル名 (昇順)</option>
+          <option value="filename_desc">📁 ファイル名 (降順)</option>
           <option value="name_asc">🔤 タイトル (A-Z)</option>
           <option value="name_desc">🔠 タイトル (Z-A)</option>
           <option value="random">🎲 ランダム</option>
@@ -1644,24 +1787,48 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       <input type="hidden" id="editItemId">
 
-      <!-- コミュニティ評価 (最優先) -->
-      <div class="form-group">
-        <div class="form-label">
-          <span>⭐ コミュニティ評価 (Rating)</span>
-          <span class="form-label-hint">0.0 〜 10.0 (Jellyfin共通スコア)</span>
-        </div>
-        <div class="rating-control-box">
-          <div class="rating-header-row">
-            <div id="ratingDisplayVal" class="rating-display-val">⭐ 8.5</div>
-            <div class="rating-presets">
-              <button type="button" class="preset-btn" onclick="setPresetRating(10.0)">10 (神作)</button>
-              <button type="button" class="preset-btn" onclick="setPresetRating(9.0)">9.0</button>
-              <button type="button" class="preset-btn" onclick="setPresetRating(8.0)">8.0</button>
-              <button type="button" class="preset-btn" onclick="setPresetRating(7.0)">7.0</button>
-              <button type="button" class="preset-btn" onclick="setPresetRating(null)">未設定</button>
-            </div>
+      <!-- 評価設定 (コミュニティ評価が左/上、個人評価が右) -->
+      <div class="ratings-row">
+        <!-- コミュニティ評価 -->
+        <div class="form-group">
+          <div class="form-label">
+            <span>⭐ コミュニティ評価</span>
+            <span class="form-label-hint">Jellyfin共通スコア</span>
           </div>
-          <input type="range" id="ratingSlider" class="rating-slider" min="0" max="10" step="0.1" value="8.0">
+          <div class="rating-control-box">
+            <div class="rating-header-row">
+              <div id="ratingDisplayVal" class="rating-display-val" style="color: var(--accent-star);">⭐ 8.5</div>
+              <div class="rating-presets">
+                <button type="button" class="preset-btn" onclick="setPresetRating(10.0)">10</button>
+                <button type="button" class="preset-btn" onclick="setPresetRating(9.0)">9.0</button>
+                <button type="button" class="preset-btn" onclick="setPresetRating(8.0)">8.0</button>
+                <button type="button" class="preset-btn" onclick="setPresetRating(7.0)">7.0</button>
+                <button type="button" class="preset-btn" onclick="setPresetRating(null)">未設定</button>
+              </div>
+            </div>
+            <input type="range" id="ratingSlider" class="rating-slider" min="0" max="10" step="0.1" value="8.0">
+          </div>
+        </div>
+
+        <!-- 個人評価 -->
+        <div class="form-group">
+          <div class="form-label">
+            <span>💕 個人評価 (User Rating)</span>
+            <span class="form-label-hint">あなたのスコア</span>
+          </div>
+          <div class="rating-control-box">
+            <div class="rating-header-row">
+              <div id="userRatingDisplayVal" class="rating-display-val" style="color: #f472b6;">💕 8.5</div>
+              <div class="rating-presets">
+                <button type="button" class="preset-btn" onclick="setPresetUserRating(10.0)">10</button>
+                <button type="button" class="preset-btn" onclick="setPresetUserRating(9.0)">9.0</button>
+                <button type="button" class="preset-btn" onclick="setPresetUserRating(8.0)">8.0</button>
+                <button type="button" class="preset-btn" onclick="setPresetUserRating(7.0)">7.0</button>
+                <button type="button" class="preset-btn" onclick="setPresetUserRating(null)">未設定</button>
+              </div>
+            </div>
+            <input type="range" id="userRatingSlider" class="rating-slider" min="0" max="10" step="0.1" value="8.0">
+          </div>
         </div>
       </div>
 
@@ -1807,6 +1974,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const modalCancelBtn = document.getElementById('modalCancelBtn');
     const modalSaveBtn = document.getElementById('modalSaveBtn');
     const editItemId = document.getElementById('editItemId');
+    const userRatingDisplayVal = document.getElementById('userRatingDisplayVal');
+    const userRatingSlider = document.getElementById('userRatingSlider');
     const ratingDisplayVal = document.getElementById('ratingDisplayVal');
     const ratingSlider = document.getElementById('ratingSlider');
     const editNameInput = document.getElementById('editNameInput');
@@ -1997,9 +2166,26 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         : `<span class="card-year unconfigured" data-id="${item.id}" title="公開日未設定（クリックして設定）">公開日未設定</span>`;
 
       const runtimeHtml = item.runtime ? `<span class="card-badge">${item.runtime}</span>` : '';
-      const ratingHtml = (item.rating !== null && item.rating !== undefined)
-        ? `<span class="card-rating" data-id="${item.id}" title="クリックして評価を編集">⭐ ${item.rating}</span>` 
-        : `<span class="card-rating" data-id="${item.id}" style="opacity:0.4;" title="クリックして評価を設定">⭐ 未設定</span>`;
+      
+      const hasUserRating = item.user_rating !== null && item.user_rating !== undefined;
+      const hasCommRating = item.rating !== null && item.rating !== undefined;
+
+      const commBadge = hasCommRating
+        ? `<span class="rating-badge-item" style="color: var(--accent-star);">⭐ ${item.rating}</span>`
+        : `<span class="rating-badge-item unrated" style="color: var(--accent-star); opacity: 0.55;">⭐ 未設定</span>`;
+
+      const userBadge = hasUserRating
+        ? `<span class="rating-badge-item" style="color: #f472b6;">💕 ${item.user_rating}</span>`
+        : `<span class="rating-badge-item unrated" style="color: #f472b6; opacity: 0.55;">💕 未設定</span>`;
+
+      const ratingHtml = `
+        <span class="card-rating" data-id="${item.id}" title="コミュニティ評価: ${hasCommRating ? item.rating : '未設定'} / 個人評価: ${hasUserRating ? item.user_rating : '未設定'} (クリックして編集)">
+          ${commBadge}
+          <span style="opacity: 0.3; font-size: 0.7rem;">|</span>
+          ${userBadge}
+        </span>
+      `;
+
       const epBadgeHtml = item.episode_badge ? `<span class="episode-tag">${item.episode_badge}</span>` : '';
       
       let actorsHtml = '';
@@ -2065,8 +2251,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       editTagsInput.value = (item.tags || []).join(', ');
       editOverviewInput.value = item.overview || '';
 
-      const rating = item.rating;
-      setRatingUi(rating);
+      setUserRatingUi(item.user_rating);
+      setRatingUi(item.rating);
 
       editModal.classList.add('open');
     }
@@ -2075,15 +2261,38 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       editModal.classList.remove('open');
     }
 
+    function setUserRatingUi(val) {
+      if (val === null || val === undefined || val === '') {
+        userRatingDisplayVal.textContent = '💕 -';
+        userRatingDisplayVal.style.color = 'var(--text-sub)';
+        userRatingSlider.value = 0;
+        userRatingSlider.dataset.cleared = 'true';
+      } else {
+        const num = parseFloat(val);
+        userRatingDisplayVal.textContent = num == 10 ? '💕 10' : `💕 ${num.toFixed(1)}`;
+        userRatingDisplayVal.style.color = '#f472b6';
+        userRatingSlider.value = num;
+        userRatingSlider.dataset.cleared = 'false';
+      }
+    }
+
+    function setPresetUserRating(val) {
+      setUserRatingUi(val);
+    }
+
+    userRatingSlider.addEventListener('input', (e) => {
+      setUserRatingUi(e.target.value);
+    });
+
     function setRatingUi(val) {
       if (val === null || val === undefined || val === '') {
-        ratingDisplayVal.textContent = '未設定';
+        ratingDisplayVal.textContent = '⭐ -';
         ratingDisplayVal.style.color = 'var(--text-sub)';
         ratingSlider.value = 0;
         ratingSlider.dataset.cleared = 'true';
       } else {
         const num = parseFloat(val);
-        ratingDisplayVal.textContent = `⭐ ${num.toFixed(1)}`;
+        ratingDisplayVal.textContent = num == 10 ? '⭐ 10' : `⭐ ${num.toFixed(1)}`;
         ratingDisplayVal.style.color = 'var(--accent-star)';
         ratingSlider.value = num;
         ratingSlider.dataset.cleared = 'false';
@@ -2106,6 +2315,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const itemId = editItemId.value;
       if (!itemId) return;
 
+      const isUserCleared = userRatingSlider.dataset.cleared === 'true';
+      const userRatingVal = isUserCleared ? null : parseFloat(userRatingSlider.value);
       const isCleared = ratingSlider.dataset.cleared === 'true';
       const ratingVal = isCleared ? null : parseFloat(ratingSlider.value);
       const nameVal = editNameInput.value.trim();
@@ -2119,6 +2330,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       try {
         const payload = {
+          user_rating: userRatingVal,
+          clear_user_rating: isUserCleared,
           community_rating: ratingVal,
           clear_rating: isCleared,
           name: nameVal,
@@ -2148,6 +2361,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         if (item) {
           item.name = data.name;
           item.rating = data.rating !== null && data.rating !== undefined ? round(data.rating, 1) : null;
+          item.user_rating = data.user_rating !== null && data.user_rating !== undefined ? round(data.user_rating, 1) : null;
           item.tags = data.tags || [];
           item.overview = data.overview || '';
           item.premiere_date = data.premiere_date || '';
