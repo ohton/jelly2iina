@@ -6,6 +6,8 @@ import base64
 import asyncio
 import random
 import time
+import logging
+from logging.handlers import RotatingFileHandler
 from typing import Optional, List, Dict, Any, Set, Tuple
 from contextlib import asynccontextmanager
 
@@ -17,6 +19,32 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "http://localhost:8096").rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "").strip()
 
+# ログ永続化設定 (/app/logs -> ホスト側 ./logs にマウント)
+LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+logger = logging.getLogger("jelly2iina")
+logger.setLevel(logging.INFO)
+
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=20 * 1024 * 1024,  # 20MB
+        backupCount=10,
+        encoding="utf-8"
+    )
+    file_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    # uvicornのアクセスログ・エラーログも同じファイルへ集約・永続化
+    logging.getLogger("uvicorn.access").addHandler(file_handler)
+    logging.getLogger("uvicorn.error").addHandler(file_handler)
+
 # HTTPクライアントの寿命管理
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -27,8 +55,10 @@ last_tags_fetch: float = 0.0
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
+    logger.info(f"jellyfin-iina-bridge starting... JELLYFIN_URL={JELLYFIN_URL}")
     http_client = httpx.AsyncClient(timeout=15.0)
     yield
+    logger.info("jellyfin-iina-bridge shutting down...")
     await http_client.aclose()
 
 app = FastAPI(title="jelly2iina", version="1.0.0", lifespan=lifespan)
@@ -1086,6 +1116,10 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
                         "role": p_role if (p_role and p_role.lower() != "actor") else ""
                     })
 
+        logger.info(
+            f"[METADATA_UPDATED] item_id={item_id} | name='{item_dto.get('Name')}' | orig='{item_dto.get('OriginalTitle')}' | tags={item_dto.get('Tags')} | genres={item_dto.get('Genres')} | actors={len(updated_actors)}"
+        )
+
         return {
             "status": "ok",
             "id": item_id,
@@ -1101,6 +1135,7 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             "year": item_dto.get("ProductionYear"),
         }
     except Exception as e:
+        logger.error(f"[METADATA_UPDATE_FAILED] item_id={item_id} | error={e}")
         raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
 
 SVG_PLACEHOLDER = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400" fill="#1e222d">

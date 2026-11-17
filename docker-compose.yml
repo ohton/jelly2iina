@@ -14,4 +14,5 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./app.py:/app/app.py
+      - ./logs:/app/logs
       - /Volumes:/Volumes:ro
