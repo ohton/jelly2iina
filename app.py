@@ -1916,7 +1916,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: var(--bg-card);
       border: 1px solid var(--border-color);
       border-radius: 16px;
-      max-width: 660px;
+      max-width: 900px;
       width: 100%;
       max-height: 92vh;
       overflow-y: auto;
