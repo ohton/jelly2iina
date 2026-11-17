@@ -249,7 +249,11 @@ SORT_CONFIG = {
 
 VALID_SEARCH_PREFIXES = {"item", "series", "actor", "genre", "studio", "tag"}
 
-def parse_search_query(q: str) -> Tuple[bool, List[Tuple[str, str]]]:
+def parse_search_query(q: str) -> Tuple[bool, List[Tuple[bool, str, str]]]:
+    """
+    クエリ文字列をパースし、(is_explicit, filters) を返す。
+    filters は [(is_not, prefix, term), ...] のリスト。
+    """
     q_str = q.strip()
     if not q_str:
         return False, []
@@ -261,23 +265,35 @@ def parse_search_query(q: str) -> Tuple[bool, List[Tuple[str, str]]]:
     if not tokens:
         return False, []
 
-    parsed: List[Tuple[str, str]] = []
-    has_explicit_prefix = False
+    parsed: List[Tuple[bool, str, str]] = []
+    has_explicit_filter = False
 
     for token in tokens:
         token = token.strip()
         if not token:
             continue
+        
+        is_not = False
+        if token.startswith("-") and len(token) > 1:
+            is_not = True
+            token = token[1:].strip()
+            has_explicit_filter = True
+        elif token.startswith("!") and len(token) > 1:
+            is_not = True
+            token = token[1:].strip()
+            has_explicit_filter = True
+
         if ":" in token:
             prefix, val = token.split(":", 1)
             p_lower = prefix.lower()
             if p_lower in VALID_SEARCH_PREFIXES and val:
-                has_explicit_prefix = True
-                parsed.append((p_lower, val))
+                has_explicit_filter = True
+                parsed.append((is_not, p_lower, val))
                 continue
-        parsed.append(("item", token))
+        
+        parsed.append((is_not, "item", token))
 
-    return has_explicit_prefix, parsed
+    return has_explicit_filter, parsed
 
 async def fetch_filter_items(
     prefix: str,
@@ -473,30 +489,77 @@ async def search_items(
                 base_params["userId"] = user_id
 
             if is_explicit:
-                # 明示的プレフィックス検索モード (各条件を並列取得し、アイテムIDの積集合 AND で絞り込み)
-                filter_tasks = [
+                # 明示的プレフィックス検索 / AND・NOT検索モード
+                positive_filters = [(p, v) for is_not, p, v in parsed_filters if not is_not]
+                negative_filters = [(p, v) for is_not, p, v in parsed_filters if is_not]
+
+                # すべてのフィルタ取得タスクを並列生成
+                tasks = [
                     fetch_filter_items(p, v, base_params, headers, user_id)
-                    for p, v in parsed_filters
+                    for p, v in (positive_filters + negative_filters)
                 ]
-                filter_results = await asyncio.gather(*filter_tasks, return_exceptions=True)
 
-                common_ids: Optional[Set[str]] = None
+                # 正の条件がなく、NOT条件のみ指定された場合（案1: ライブラリ全件をベース集合とする）
+                need_base_fetch = len(positive_filters) == 0
+                if need_base_fetch:
+                    tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={
+                                **base_params,
+                                "sortBy": sort_field,
+                                "sortOrder": sort_order,
+                                "limit": 500
+                            },
+                            headers=headers
+                        )
+                    )
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                num_pos = len(positive_filters)
+                num_neg = len(negative_filters)
+
+                pos_results = results[:num_pos]
+                neg_results = results[num_pos:num_pos + num_neg]
+
                 items_pool: Dict[str, Any] = {}
+                positive_ids: Optional[Set[str]] = None
 
-                for res in filter_results:
-                    if isinstance(res, Exception):
-                        res = {}
-                    items_pool.update(res)
-                    ids = set(res.keys())
-                    if common_ids is None:
-                        common_ids = ids
-                    else:
-                        common_ids = common_ids.intersection(ids)
-
-                if common_ids is None:
-                    all_items = []
+                if need_base_fetch:
+                    base_res = results[-1]
+                    base_ids: Set[str] = set()
+                    if not isinstance(base_res, Exception) and base_res.status_code == 200:
+                        for it in base_res.json().get("Items", []):
+                            if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                                iid = it["Id"]
+                                items_pool[iid] = it
+                                base_ids.add(iid)
+                    positive_ids = base_ids
                 else:
-                    all_items = [items_pool[iid] for iid in common_ids if iid in items_pool]
+                    for res in pos_results:
+                        if isinstance(res, Exception):
+                            res = {}
+                        items_pool.update(res)
+                        ids = set(res.keys())
+                        if positive_ids is None:
+                            positive_ids = ids
+                        else:
+                            positive_ids = positive_ids.intersection(ids)
+
+                if positive_ids is None:
+                    positive_ids = set()
+
+                # ネガティブ条件（NOT）でヒットした除外対象アイテムIDを収集
+                excluded_ids: Set[str] = set()
+                for res in neg_results:
+                    if isinstance(res, Exception):
+                        continue
+                    excluded_ids.update(res.keys())
+
+                # 差集合判定 (正の集合 - 除外集合)
+                final_ids = positive_ids - excluded_ids
+                all_items = [items_pool[iid] for iid in final_ids if iid in items_pool]
             else:
                 # 従来の横断検索モード (6系統の並列取得 & 和集合 OR 集約)
                 search_lower = search_term.lower()
@@ -1930,7 +1993,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       <div class="controls-wrapper">
         <div class="search-bar">
           <span class="search-icon">🔍</span>
-          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" title="検索のヒント: series:シリーズ名, actor:出演者, genre:ジャンル, studio:スタジオ, tag:タグ, item:動画名。スペース区切りでAND検索も可能" autocomplete="off">
+          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" title="検索のヒント: series:シリーズ名, actor:出演者, genre:ジャンル, studio:スタジオ, tag:タグ, item:動画名。-tag:ホラー でNOT除外、スペース区切りでAND検索も可能" autocomplete="off">
           <button id="clearBtn" class="clear-btn" title="クリア">✕</button>
         </div>
 
