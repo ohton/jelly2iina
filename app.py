@@ -2703,14 +2703,25 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         return;
       }
 
+      function formatPrefixQuery(prefix, value) {
+        if (!value) return '';
+        const trimmed = value.trim();
+        if (trimmed.includes(' ') || trimmed.includes(':') || trimmed.includes('"')) {
+          const escaped = trimmed.replace(/"/g, '\\"');
+          return `${prefix}:"${escaped}"`;
+        }
+        return `${prefix}:${trimmed}`;
+      }
+
       // シリーズ名クリックによる絞り込み検索
       const seriesEl = e.target.closest('.card-series');
       if (seriesEl) {
         const series = seriesEl.getAttribute('data-series');
         if (series) {
-          searchInput.value = series;
+          const qVal = formatPrefixQuery('series', series);
+          searchInput.value = qVal;
           clearBtn.style.display = 'block';
-          currentQuery = series;
+          currentQuery = qVal;
           window.scrollTo({ top: 0, behavior: 'smooth' });
           resetAndReload();
           return;
@@ -2722,9 +2733,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       if (tagBadge) {
         const tag = tagBadge.getAttribute('data-tag');
         if (tag) {
-          searchInput.value = tag;
+          const qVal = formatPrefixQuery('tag', tag);
+          searchInput.value = qVal;
           clearBtn.style.display = 'block';
-          currentQuery = tag;
+          currentQuery = qVal;
           window.scrollTo({ top: 0, behavior: 'smooth' });
           resetAndReload();
           return;
@@ -2736,9 +2748,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       if (actorBadge) {
         const actor = actorBadge.getAttribute('data-actor');
         if (actor) {
-          searchInput.value = actor;
+          const qVal = formatPrefixQuery('actor', actor);
+          searchInput.value = qVal;
           clearBtn.style.display = 'block';
-          currentQuery = actor;
+          currentQuery = qVal;
           window.scrollTo({ top: 0, behavior: 'smooth' });
           resetAndReload();
           return;
