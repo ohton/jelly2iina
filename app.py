@@ -894,8 +894,9 @@ class MetadataUpdateRequest(BaseModel):
     clear_premiere_date: Optional[bool] = False
 
 # 全てのItemFieldsを列挙して取得時に未編集フィールド（原題OriginalTitle, ProviderIds, SortName等）がPOST更新で消去されるのを防止
+# (※ Trickplay はJellyfinのPOST更新時に内部型エラーを引き起こすため除外)
 ALL_UPDATE_FIELDS = (
-    "AirTime,CanDelete,CanDownload,ChannelInfo,Chapters,Trickplay,ChildCount,"
+    "AirTime,CanDelete,CanDownload,ChannelInfo,Chapters,ChildCount,"
     "CumulativeRunTimeTicks,CustomRating,DateCreated,DateLastMediaAdded,DisplayPreferencesId,"
     "Etag,ExternalUrls,Genres,ItemCounts,MediaSourceCount,MediaSources,OriginalTitle,Overview,"
     "ParentId,Path,People,PlayAccess,ProductionLocations,ProviderIds,PrimaryImageAspectRatio,"
@@ -934,6 +935,7 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         if not items:
             raise HTTPException(status_code=404, detail="Item not found")
         item_dto = items[0]
+        item_dto.pop("Trickplay", None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
