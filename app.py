@@ -856,7 +856,8 @@ async def search_items(
                 "user_rating": round(user_rating, 1) if user_rating is not None else None,
                 "premiere_date": it.get("PremiereDate", "")[:10] if it.get("PremiereDate") else "",
                 "tags": tags[:12],
-                "actors": actors[:8],
+                "genres": it.get("Genres", []) or [],
+                "actors": actors,
                 "studios": studios[:2],
                 "year": it.get("ProductionYear"),
                 "overview": it.get("Overview", ""),
@@ -879,6 +880,8 @@ class MetadataUpdateRequest(BaseModel):
     name: Optional[str] = None
     overview: Optional[str] = None
     tags: Optional[List[str]] = None
+    genres: Optional[List[str]] = None
+    actors: Optional[List[str]] = None
     premiere_date: Optional[str] = None
     clear_premiere_date: Optional[bool] = False
 
@@ -894,7 +897,7 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
     try:
         fetch_params = {
             "ids": item_id,
-            "fields": "CommunityRating,Tags,Overview,Genres,Studios,PremiereDate,ProductionYear,UserData",
+            "fields": "CommunityRating,Tags,Overview,Genres,Studios,PremiereDate,ProductionYear,UserData,People",
         }
         if user_id:
             fetch_params["userId"] = user_id
@@ -934,6 +937,45 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             if t and t not in cleaned_tags:
                 cleaned_tags.append(t)
         item_dto["Tags"] = cleaned_tags
+
+    if payload.genres is not None:
+        cleaned_genres = []
+        for g in payload.genres:
+            g = g.strip()
+            if g and g not in cleaned_genres:
+                cleaned_genres.append(g)
+        item_dto["Genres"] = cleaned_genres
+
+    if payload.actors is not None:
+        cleaned_actor_names = []
+        for a in payload.actors:
+            a = a.strip()
+            if a and a not in cleaned_actor_names:
+                cleaned_actor_names.append(a)
+
+        existing_people = item_dto.get("People") or []
+        # 監督・脚本など非Actorの役職はそのまま保持
+        non_actor_people = [
+            p for p in existing_people
+            if p.get("Type") != "Actor" and (p.get("Role") or "").lower() != "actor"
+        ]
+
+        new_actor_people = []
+        for a_name in cleaned_actor_names:
+            existing_p = next((p for p in existing_people if p.get("Name") == a_name), None)
+            if existing_p:
+                p_dict = dict(existing_p)
+                p_dict["Type"] = "Actor"
+                p_dict["Role"] = "Actor"
+                new_actor_people.append(p_dict)
+            else:
+                new_actor_people.append({
+                    "Name": a_name,
+                    "Role": "Actor",
+                    "Type": "Actor"
+                })
+
+        item_dto["People"] = non_actor_people + new_actor_people
 
     if payload.clear_premiere_date:
         item_dto["PremiereDate"] = None
@@ -995,6 +1037,13 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         else:
             premiere_date_str = ""
 
+        updated_actors = []
+        for p in item_dto.get("People", []):
+            if p.get("Type") == "Actor" or (p.get("Role") or "").lower() == "actor":
+                p_name = p.get("Name")
+                if p_name and p_name not in updated_actors:
+                    updated_actors.append(p_name)
+
         return {
             "status": "ok",
             "id": item_id,
@@ -1002,12 +1051,12 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             "user_rating": updated_user_rating,
             "name": item_dto.get("Name"),
             "tags": item_dto.get("Tags", []),
+            "genres": item_dto.get("Genres", []),
+            "actors": updated_actors,
             "overview": item_dto.get("Overview", ""),
             "premiere_date": premiere_date_str,
             "year": item_dto.get("ProductionYear"),
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
 
@@ -2117,30 +2166,50 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- タイトル -->
-      <div class="form-group">
-        <div class="form-label">
-          <span>動画タイトル</span>
+      <!-- タイトル & 公開日 (2カラム) -->
+      <div class="ratings-row">
+        <div class="form-group">
+          <div class="form-label">
+            <span>動画タイトル</span>
+          </div>
+          <input type="text" id="editNameInput" class="form-input" placeholder="動画タイトル">
         </div>
-        <input type="text" id="editNameInput" class="form-input" placeholder="動画タイトル">
+
+        <div class="form-group">
+          <div class="form-label">
+            <span>📅 公開日 (Premiere Date)</span>
+            <span class="form-label-hint">年/月/日</span>
+          </div>
+          <div style="display:flex; gap:0.5rem; align-items:center;">
+            <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
+            <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.55rem 0.75rem; font-size:0.75rem; white-space:nowrap;" title="公開日を未設定にする">未設定</button>
+          </div>
+        </div>
       </div>
 
-      <!-- 公開日 -->
-      <div class="form-group">
-        <div class="form-label">
-          <span>📅 公開日 (Premiere Date)</span>
-          <span class="form-label-hint">年/月/日 (ソート基準・年号表示に使用)</span>
+      <!-- ジャンル & 出演者 (2カラム) -->
+      <div class="ratings-row">
+        <div class="form-group">
+          <div class="form-label">
+            <span>🎭 ジャンル (Genres)</span>
+            <span class="form-label-hint">カンマ区切り</span>
+          </div>
+          <input type="text" id="editGenresInput" class="form-input" placeholder="例: アニメ, コメディ, SF">
         </div>
-        <div style="display:flex; gap:0.5rem; align-items:center;">
-          <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
-          <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.65rem 0.9rem; font-size:0.8rem; white-space:nowrap;" title="公開日を未設定にする">未設定にする</button>
+
+        <div class="form-group">
+          <div class="form-label">
+            <span>👤 出演者 (Actors)</span>
+            <span class="form-label-hint">カンマ区切り (Role: Actor)</span>
+          </div>
+          <input type="text" id="editActorsInput" class="form-input" placeholder="例: タモリ, 山田太郎">
         </div>
       </div>
 
       <!-- タグ -->
       <div class="form-group">
         <div class="form-label">
-          <span>タグ (Tags)</span>
+          <span>🏷️ タグ (Tags)</span>
           <span class="form-label-hint">カンマ区切りで複数指定</span>
         </div>
         <input type="text" id="editTagsInput" class="form-input" placeholder="例: アニメ, アクション, SF, ドラマ">
@@ -2264,6 +2333,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const ratingDisplayVal = document.getElementById('ratingDisplayVal');
     const ratingSlider = document.getElementById('ratingSlider');
     const editNameInput = document.getElementById('editNameInput');
+    const editGenresInput = document.getElementById('editGenresInput');
+    const editActorsInput = document.getElementById('editActorsInput');
     const editTagsInput = document.getElementById('editTagsInput');
     const editOverviewInput = document.getElementById('editOverviewInput');
     const editPremiereDateInput = document.getElementById('editPremiereDateInput');
@@ -2533,6 +2604,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       editItemId.value = itemId;
       editNameInput.value = item.name || '';
       editPremiereDateInput.value = item.premiere_date || '';
+      editGenresInput.value = (item.genres || []).join(', ');
+      editActorsInput.value = (item.actors || []).join(', ');
       editTagsInput.value = (item.tags || []).join(', ');
       editOverviewInput.value = item.overview || '';
 
@@ -2607,6 +2680,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const nameVal = editNameInput.value.trim();
       const premiereDateVal = editPremiereDateInput.value;
       const isDateCleared = !premiereDateVal;
+      const genresVal = editGenresInput.value.split(',').map(s => s.trim()).filter(Boolean);
+      const actorsVal = editActorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
       const tagsVal = editTagsInput.value.split(',').map(s => s.trim()).filter(Boolean);
       const overviewVal = editOverviewInput.value.trim();
 
@@ -2620,6 +2695,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           community_rating: ratingVal,
           clear_rating: isCleared,
           name: nameVal,
+          genres: genresVal,
+          actors: actorsVal,
           tags: tagsVal,
           overview: overviewVal,
           premiere_date: premiereDateVal,
@@ -2648,6 +2725,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           item.rating = data.rating !== null && data.rating !== undefined ? round(data.rating, 1) : null;
           item.user_rating = data.user_rating !== null && data.user_rating !== undefined ? round(data.user_rating, 1) : null;
           item.tags = data.tags || [];
+          item.genres = data.genres || [];
+          item.actors = data.actors || [];
           item.overview = data.overview || '';
           item.premiere_date = data.premiere_date || '';
           item.year = data.year;
