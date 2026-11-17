@@ -1665,6 +1665,34 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       border-color: #10b981;
     }
 
+    .card-genres {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .genre-badge {
+      background: rgba(245, 158, 11, 0.12);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      font-size: 0.72rem;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: var(--transition);
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.2rem;
+    }
+
+    .genre-badge:hover {
+      background: #f59e0b;
+      color: #ffffff;
+      border-color: #f59e0b;
+    }
+
     .card-tags {
       display: flex;
       flex-wrap: wrap;
@@ -2581,6 +2609,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       const epBadgeHtml = item.episode_badge ? `<span class="episode-tag">${item.episode_badge}</span>` : '';
       
+      let genresHtml = '';
+      if (item.genres && item.genres.length > 0) {
+        genresHtml = `<div class="card-genres">` + 
+          item.genres.map(g => `<span class="genre-badge" data-genre="${escapeHtml(g)}" title="このジャンルで検索: ${escapeHtml(g)}">🎭 ${escapeHtml(g)}</span>`).join('') +
+          `</div>`;
+      }
+
       let actorsHtml = '';
       if (item.actors && item.actors.length > 0) {
         actorsHtml = `<div class="card-actors">` + 
@@ -2625,6 +2660,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               ${yearHtml}
             </div>
             <div class="card-title" title="${escapeHtml(item.name)}">${epBadgeHtml}${escapeHtml(item.name)}</div>
+            ${genresHtml}
             ${actorsHtml}
             ${tagsHtml}
             <div class="card-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path || 'パスなし')}</div>
@@ -2925,6 +2961,21 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const tag = tagBadge.getAttribute('data-tag');
         if (tag) {
           const qVal = formatPrefixQuery('tag', tag);
+          searchInput.value = qVal;
+          clearBtn.style.display = 'block';
+          currentQuery = qVal;
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          resetAndReload();
+          return;
+        }
+      }
+
+      // ジャンルバッジクリックによる絞り込み検索
+      const genreBadge = e.target.closest('.genre-badge');
+      if (genreBadge) {
+        const genre = genreBadge.getAttribute('data-genre');
+        if (genre) {
+          const qVal = formatPrefixQuery('genre', genre);
           searchInput.value = qVal;
           clearBtn.style.display = 'block';
           currentQuery = qVal;
