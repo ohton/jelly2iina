@@ -844,6 +844,7 @@ async def search_items(
                 "path": path,
                 "server_os": srv_os,
                 "stream_url": stream_url,
+                "jellyfin_url": f"{JELLYFIN_URL}/web/index.html#!/details?id={item_id}",
                 "iina_file_url": iina_file,
                 "iina_stream_url": iina_stream,
                 "mpv_file_url": mpv_file,
@@ -1744,6 +1745,20 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: #36425c;
     }
 
+    .jf-detail-btn {
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+
+    .jf-detail-btn:hover {
+      background: #36425c;
+      color: #a78bfa;
+      transform: translateY(-1px);
+    }
+
     .empty-state {
       text-align: center;
       padding: 4rem 1rem;
@@ -2590,6 +2605,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               ${playBtn}
               <button class="btn btn-secondary copy-btn" data-path="${escapeHtml(item.path)}" title="ファイルパスをコピー">📋</button>
               <button class="btn btn-secondary copy-stream-btn" data-stream="${escapeHtml(item.stream_url)}" title="Direct Stream URLをコピー">🔗</button>
+              <a href="${escapeHtml(item.jellyfin_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-secondary jf-detail-btn" title="Jellyfinで詳細ページを開く (別タブ)">🌐</a>
             </div>
           </div>
         </div>
