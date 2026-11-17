@@ -2286,36 +2286,36 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- タイトル & 原題 (2カラム) -->
-      <div class="ratings-row">
-        <div class="form-group">
-          <div class="form-label">
-            <span>動画タイトル</span>
-          </div>
-          <input type="text" id="editNameInput" class="form-input" placeholder="動画タイトル">
+      <!-- 動画タイトル -->
+      <div class="form-group">
+        <div class="form-label">
+          <span>動画タイトル</span>
         </div>
+        <input type="text" id="editNameInput" class="form-input" placeholder="動画タイトル">
+      </div>
 
+      <!-- 原題 & 公開日 (2カラム) -->
+      <div class="ratings-row">
         <div class="form-group">
           <div class="form-label">
             <span>原題 (Original Title)</span>
           </div>
           <input type="text" id="editOriginalTitleInput" class="form-input" placeholder="原題">
         </div>
+
+        <div class="form-group">
+          <div class="form-label">
+            <span>📅 公開日 (Premiere Date)</span>
+            <span class="form-label-hint">年/月/日</span>
+          </div>
+          <div style="display:flex; gap:0.5rem; align-items:center;">
+            <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
+            <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.55rem 0.75rem; font-size:0.75rem; white-space:nowrap;" title="公開日を未設定にする">未設定</button>
+          </div>
+        </div>
       </div>
 
-      <!-- 公開日 -->
-      <div class="form-group">
-        <div class="form-label">
-          <span>📅 公開日 (Premiere Date)</span>
-          <span class="form-label-hint">年/月/日</span>
-        </div>
-        <div style="display:flex; gap:0.5rem; align-items:center;">
-          <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
-          <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.55rem 0.75rem; font-size:0.75rem; white-space:nowrap;" title="公開日を未設定にする">未設定</button>
-        </div>
-      </div>
-
-      <!-- ジャンル & 出演者 (2カラム) -->
+      <!-- ジャンル & タグ (2カラム) -->
       <div class="ratings-row">
         <div class="form-group">
           <div class="form-label">
@@ -2327,20 +2327,20 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
         <div class="form-group">
           <div class="form-label">
-            <span>👤 出演者 (Actors)</span>
-            <span class="form-label-hint">カンマ区切り (名前:役名)</span>
+            <span>🏷️ タグ (Tags)</span>
+            <span class="form-label-hint">カンマ区切りで複数指定</span>
           </div>
-          <input type="text" id="editActorsInput" class="form-input" placeholder="例: 田村正和:古畑任三郎, 西村雅彦:今泉慎太郎">
+          <input type="text" id="editTagsInput" class="form-input" placeholder="例: アニメ, アクション, SF, ドラマ">
         </div>
       </div>
 
-      <!-- タグ -->
+      <!-- 出演者 -->
       <div class="form-group">
         <div class="form-label">
-          <span>🏷️ タグ (Tags)</span>
-          <span class="form-label-hint">カンマ区切りで複数指定</span>
+          <span>👤 出演者 (Actors)</span>
+          <span class="form-label-hint">カンマ区切り (名前:役名)</span>
         </div>
-        <input type="text" id="editTagsInput" class="form-input" placeholder="例: アニメ, アクション, SF, ドラマ">
+        <input type="text" id="editActorsInput" class="form-input" placeholder="例: 田村正和:古畑任三郎, 西村雅彦:今泉慎太郎">
       </div>
 
       <!-- 概要 -->
