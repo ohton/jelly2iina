@@ -474,7 +474,7 @@ async def search_items(
     server_os = await detect_server_os()
     user_id = await get_current_user_id()
 
-    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData"
+    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData,OriginalTitle"
 
     try:
         if q and q.strip():
@@ -866,6 +866,7 @@ async def search_items(
                 "actors": actors,
                 "studios": studios[:2],
                 "year": it.get("ProductionYear"),
+                "original_title": it.get("OriginalTitle") or "",
                 "overview": it.get("Overview", ""),
             })
 
@@ -884,12 +885,25 @@ class MetadataUpdateRequest(BaseModel):
     user_rating: Optional[float] = None
     clear_user_rating: Optional[bool] = False
     name: Optional[str] = None
+    original_title: Optional[str] = None
     overview: Optional[str] = None
     tags: Optional[List[str]] = None
     genres: Optional[List[str]] = None
     actors: Optional[List[str]] = None
     premiere_date: Optional[str] = None
     clear_premiere_date: Optional[bool] = False
+
+# 全てのItemFieldsを列挙して取得時に未編集フィールド（原題OriginalTitle, ProviderIds, SortName等）がPOST更新で消去されるのを防止
+ALL_UPDATE_FIELDS = (
+    "AirTime,CanDelete,CanDownload,ChannelInfo,Chapters,Trickplay,ChildCount,"
+    "CumulativeRunTimeTicks,CustomRating,DateCreated,DateLastMediaAdded,DisplayPreferencesId,"
+    "Etag,ExternalUrls,Genres,ItemCounts,MediaSourceCount,MediaSources,OriginalTitle,Overview,"
+    "ParentId,Path,People,PlayAccess,ProductionLocations,ProviderIds,PrimaryImageAspectRatio,"
+    "RecursiveItemCount,Settings,SeriesStudio,SortName,SpecialEpisodeNumbers,Studios,Taglines,Tags,"
+    "RemoteTrailers,MediaStreams,SeasonUserData,DateLastRefreshed,DateLastSaved,RefreshState,"
+    "ChannelImage,EnableMediaSourceDisplay,Width,Height,ExtraIds,LocalTrailerCount,IsHD,SpecialFeatureCount,"
+    "CommunityRating,PremiereDate,ProductionYear"
+)
 
 @app.post("/api/items/{item_id}/metadata")
 async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
@@ -899,11 +913,11 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
     headers = get_auth_headers()
     user_id = await get_current_user_id()
 
-    # 1. 現在のアイテムオブジェクトを取得
+    # 1. 現在のアイテムオブジェクトを取得 (全フィールドを取得して未編集情報の欠落を防ぐ)
     try:
         fetch_params = {
             "ids": item_id,
-            "fields": "CommunityRating,Tags,Overview,Genres,Studios,PremiereDate,ProductionYear,UserData,People",
+            "fields": ALL_UPDATE_FIELDS,
         }
         if user_id:
             fetch_params["userId"] = user_id
@@ -931,6 +945,9 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
 
     if payload.name is not None and payload.name.strip():
         item_dto["Name"] = payload.name.strip()
+
+    if payload.original_title is not None:
+        item_dto["OriginalTitle"] = payload.original_title.strip()
 
     if payload.overview is not None:
         item_dto["Overview"] = payload.overview.strip()
@@ -1073,6 +1090,7 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             "rating": item_dto.get("CommunityRating"),
             "user_rating": updated_user_rating,
             "name": item_dto.get("Name"),
+            "original_title": item_dto.get("OriginalTitle") or "",
             "tags": item_dto.get("Tags", []),
             "genres": item_dto.get("Genres", []),
             "actors": updated_actors,
@@ -2231,7 +2249,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- タイトル & 公開日 (2カラム) -->
+      <!-- タイトル & 原題 (2カラム) -->
       <div class="ratings-row">
         <div class="form-group">
           <div class="form-label">
@@ -2242,13 +2260,21 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
         <div class="form-group">
           <div class="form-label">
-            <span>📅 公開日 (Premiere Date)</span>
-            <span class="form-label-hint">年/月/日</span>
+            <span>原題 (Original Title)</span>
           </div>
-          <div style="display:flex; gap:0.5rem; align-items:center;">
-            <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
-            <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.55rem 0.75rem; font-size:0.75rem; white-space:nowrap;" title="公開日を未設定にする">未設定</button>
-          </div>
+          <input type="text" id="editOriginalTitleInput" class="form-input" placeholder="原題">
+        </div>
+      </div>
+
+      <!-- 公開日 -->
+      <div class="form-group">
+        <div class="form-label">
+          <span>📅 公開日 (Premiere Date)</span>
+          <span class="form-label-hint">年/月/日</span>
+        </div>
+        <div style="display:flex; gap:0.5rem; align-items:center;">
+          <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
+          <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.55rem 0.75rem; font-size:0.75rem; white-space:nowrap;" title="公開日を未設定にする">未設定</button>
         </div>
       </div>
 
@@ -2398,6 +2424,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const ratingDisplayVal = document.getElementById('ratingDisplayVal');
     const ratingSlider = document.getElementById('ratingSlider');
     const editNameInput = document.getElementById('editNameInput');
+    const editOriginalTitleInput = document.getElementById('editOriginalTitleInput');
     const editGenresInput = document.getElementById('editGenresInput');
     const editActorsInput = document.getElementById('editActorsInput');
     const editTagsInput = document.getElementById('editTagsInput');
@@ -2682,6 +2709,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       editItemId.value = itemId;
       editNameInput.value = item.name || '';
+      editOriginalTitleInput.value = item.original_title || '';
       editPremiereDateInput.value = item.premiere_date || '';
       editGenresInput.value = (item.genres || []).join(', ');
       editActorsInput.value = (item.actors || []).map(a => {
@@ -2763,6 +2791,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const isCleared = ratingSlider.dataset.cleared === 'true';
       const ratingVal = isCleared ? null : parseFloat(ratingSlider.value);
       const nameVal = editNameInput.value.trim();
+      const originalTitleVal = editOriginalTitleInput.value.trim();
       const premiereDateVal = editPremiereDateInput.value;
       const isDateCleared = !premiereDateVal;
       const genresVal = editGenresInput.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -2780,6 +2809,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           community_rating: ratingVal,
           clear_rating: isCleared,
           name: nameVal,
+          original_title: originalTitleVal,
           genres: genresVal,
           actors: actorsVal,
           tags: tagsVal,
@@ -2807,6 +2837,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const item = itemsCache.get(itemId);
         if (item) {
           item.name = data.name;
+          item.original_title = data.original_title || '';
           item.rating = data.rating !== null && data.rating !== undefined ? round(data.rating, 1) : null;
           item.user_rating = data.user_rating !== null && data.user_rating !== undefined ? round(data.user_rating, 1) : null;
           item.tags = data.tags || [];
