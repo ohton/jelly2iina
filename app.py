@@ -1,11 +1,12 @@
 import os
 import re
+import shlex
 import urllib.parse
 import base64
 import asyncio
 import random
 import time
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Tuple
 from contextlib import asynccontextmanager
 
 import httpx
@@ -246,6 +247,199 @@ SORT_CONFIG = {
     "random": ("Random", "Ascending"),
 }
 
+VALID_SEARCH_PREFIXES = {"item", "series", "actor", "genre", "studio", "tag"}
+
+def parse_search_query(q: str) -> Tuple[bool, List[Tuple[str, str]]]:
+    q_str = q.strip()
+    if not q_str:
+        return False, []
+    try:
+        tokens = shlex.split(q_str)
+    except ValueError:
+        tokens = q_str.split()
+
+    if not tokens:
+        return False, []
+
+    parsed: List[Tuple[str, str]] = []
+    has_explicit_prefix = False
+
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            prefix, val = token.split(":", 1)
+            p_lower = prefix.lower()
+            if p_lower in VALID_SEARCH_PREFIXES and val:
+                has_explicit_prefix = True
+                parsed.append((p_lower, val))
+                continue
+        parsed.append(("item", token))
+
+    return has_explicit_prefix, parsed
+
+async def fetch_filter_items(
+    prefix: str,
+    val: str,
+    base_params: Dict[str, Any],
+    headers: Dict[str, str],
+    user_id: Optional[str]
+) -> Dict[str, Any]:
+    items_map: Dict[str, Any] = {}
+    val_lower = val.lower()
+
+    if prefix == "item":
+        try:
+            r = await http_client.get(
+                f"{JELLYFIN_URL}/Items",
+                params={**base_params, "searchTerm": val, "limit": 2000},
+                headers=headers
+            )
+            if r.status_code == 200:
+                for it in r.json().get("Items", []):
+                    if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                        items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "series":
+        try:
+            r_series = await http_client.get(
+                f"{JELLYFIN_URL}/Items",
+                params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": val, "limit": 50},
+                headers=headers
+            )
+            series_ids = []
+            if r_series.status_code == 200:
+                for s in r_series.json().get("Items", []):
+                    if s.get("Id"):
+                        series_ids.append(s["Id"])
+            
+            if series_ids:
+                episode_params = {"fields": base_params.get("fields", "")}
+                if user_id:
+                    episode_params["userId"] = user_id
+                
+                ep_tasks = [
+                    http_client.get(
+                        f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
+                        params=episode_params,
+                        headers=headers
+                    )
+                    for sid in series_ids
+                ]
+                ep_res = await asyncio.gather(*ep_tasks, return_exceptions=True)
+                for res in ep_res:
+                    if not isinstance(res, Exception) and res.status_code == 200:
+                        for it in res.json().get("Items", []):
+                            if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                                items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "actor":
+        try:
+            r_person = await http_client.get(
+                f"{JELLYFIN_URL}/Persons",
+                params={"searchTerm": val, "limit": 30},
+                headers=headers
+            )
+            person_ids = []
+            if r_person.status_code == 200:
+                for p in r_person.json().get("Items", []):
+                    if p.get("Id"):
+                        person_ids.append(p["Id"])
+            
+            if person_ids:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "genre":
+        try:
+            r_genre = await http_client.get(
+                f"{JELLYFIN_URL}/Genres",
+                params={"searchTerm": val, "limit": 20},
+                headers=headers
+            )
+            genre_ids = []
+            if r_genre.status_code == 200:
+                for g in r_genre.json().get("Items", []):
+                    if g.get("Id"):
+                        genre_ids.append(g["Id"])
+            
+            if genre_ids:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "studio":
+        try:
+            r_studio = await http_client.get(
+                f"{JELLYFIN_URL}/Studios",
+                params={"searchTerm": val, "limit": 30},
+                headers=headers
+            )
+            studio_ids = []
+            if r_studio.status_code == 200:
+                for s in r_studio.json().get("Items", []):
+                    if s.get("Id"):
+                        studio_ids.append(s["Id"])
+            
+            if studio_ids:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "tag":
+        try:
+            all_tags = await get_all_tags()
+            matched_tags = []
+            if isinstance(all_tags, list):
+                for tag in all_tags:
+                    if val_lower in tag.lower() or tag.lower() in val_lower:
+                        matched_tags.append(tag)
+            
+            if matched_tags:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    return items_map
+
 @app.get("/api/search")
 async def search_items(
     q: Optional[str] = Query(None, description="Search term"),
@@ -269,7 +463,7 @@ async def search_items(
     try:
         if q and q.strip():
             search_term = q.strip()
-            search_lower = search_term.lower()
+            is_explicit, parsed_filters = parse_search_query(search_term)
             base_params = {
                 "recursive": "true",
                 "includeItemTypes": "Movie,Episode,Video",
@@ -278,135 +472,163 @@ async def search_items(
             if user_id:
                 base_params["userId"] = user_id
 
-            tasks = [
-                # 1. 通常のアイテム検索 (上限を大きく拡大)
-                http_client.get(
-                    f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "searchTerm": search_term, "limit": 2000},
-                    headers=headers
-                ),
-                # 2. シリーズ (Series) 自体の検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Items",
-                    params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": search_term, "limit": 50},
-                    headers=headers
-                ),
-                # 3. 出演者検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Persons",
-                    params={"searchTerm": search_term, "limit": 30},
-                    headers=headers
-                ),
-                # 4. ジャンル検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Genres",
-                    params={"searchTerm": search_term, "limit": 20},
-                    headers=headers
-                ),
-                # 5. スタジオ検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Studios",
-                    params={"searchTerm": search_term, "limit": 30},
-                    headers=headers
-                ),
-                # 6. タグ一覧取得
-                get_all_tags(),
-            ]
+            if is_explicit:
+                # 明示的プレフィックス検索モード (各条件を並列取得し、アイテムIDの積集合 AND で絞り込み)
+                filter_tasks = [
+                    fetch_filter_items(p, v, base_params, headers, user_id)
+                    for p, v in parsed_filters
+                ]
+                filter_results = await asyncio.gather(*filter_tasks, return_exceptions=True)
 
-            r1, r_series, r_person, r_genre, r_studio, all_tags = await asyncio.gather(*tasks, return_exceptions=True)
+                common_ids: Optional[Set[str]] = None
+                items_pool: Dict[str, Any] = {}
 
-            items_map: Dict[str, Any] = {}
-            if not isinstance(r1, Exception) and r1.status_code == 200:
-                for it in r1.json().get("Items", []):
-                    items_map[it.get("Id")] = it
+                for res in filter_results:
+                    if isinstance(res, Exception):
+                        res = {}
+                    items_pool.update(res)
+                    ids = set(res.keys())
+                    if common_ids is None:
+                        common_ids = ids
+                    else:
+                        common_ids = common_ids.intersection(ids)
 
-            series_ids: List[str] = []
-            if not isinstance(r_series, Exception) and r_series.status_code == 200:
-                for s in r_series.json().get("Items", []):
-                    if s.get("Id"):
-                        series_ids.append(s.get("Id"))
-
-            person_ids: List[str] = []
-            if not isinstance(r_person, Exception) and r_person.status_code == 200:
-                for p in r_person.json().get("Items", []):
-                    if p.get("Id"):
-                        person_ids.append(p.get("Id"))
-
-            genre_ids: List[str] = []
-            if not isinstance(r_genre, Exception) and r_genre.status_code == 200:
-                for g in r_genre.json().get("Items", []):
-                    if g.get("Id"):
-                        genre_ids.append(g.get("Id"))
-
-            studio_ids: List[str] = []
-            if not isinstance(r_studio, Exception) and r_studio.status_code == 200:
-                for s in r_studio.json().get("Items", []):
-                    if s.get("Id"):
-                        studio_ids.append(s.get("Id"))
-
-            matched_tags: List[str] = []
-            if isinstance(all_tags, list):
-                for tag in all_tags:
-                    if search_lower in tag.lower() or tag.lower() in search_lower:
-                        matched_tags.append(tag)
-
-            extra_tasks = []
-            # シリーズエピソードは話数上限を設けない（全エピソード漏れなく取得）
-            episode_params = {"fields": base_fields}
-            if user_id:
-                episode_params["userId"] = user_id
-
-            for sid in series_ids:
-                extra_tasks.append(
-                    http_client.get(
-                        f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
-                        params=episode_params,
-                        headers=headers
-                    )
-                )
-
-            if person_ids:
-                extra_tasks.append(
+                if common_ids is None:
+                    all_items = []
+                else:
+                    all_items = [items_pool[iid] for iid in common_ids if iid in items_pool]
+            else:
+                # 従来の横断検索モード (6系統の並列取得 & 和集合 OR 集約)
+                search_lower = search_term.lower()
+                tasks = [
+                    # 1. 通常のアイテム検索 (上限を大きく拡大)
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                        params={**base_params, "searchTerm": search_term, "limit": 2000},
                         headers=headers
-                    )
-                )
-            if genre_ids:
-                extra_tasks.append(
+                    ),
+                    # 2. シリーズ (Series) 自体の検索
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                        params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": search_term, "limit": 50},
                         headers=headers
-                    )
-                )
-            if studio_ids:
-                extra_tasks.append(
+                    ),
+                    # 3. 出演者検索
                     http_client.get(
-                        f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                        f"{JELLYFIN_URL}/Persons",
+                        params={"searchTerm": search_term, "limit": 30},
                         headers=headers
-                    )
-                )
-            if matched_tags:
-                extra_tasks.append(
+                    ),
+                    # 4. ジャンル検索
                     http_client.get(
-                        f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                        f"{JELLYFIN_URL}/Genres",
+                        params={"searchTerm": search_term, "limit": 20},
                         headers=headers
-                    )
-                )
+                    ),
+                    # 5. スタジオ検索
+                    http_client.get(
+                        f"{JELLYFIN_URL}/Studios",
+                        params={"searchTerm": search_term, "limit": 30},
+                        headers=headers
+                    ),
+                    # 6. タグ一覧取得
+                    get_all_tags(),
+                ]
 
-            if extra_tasks:
-                extra_res = await asyncio.gather(*extra_tasks, return_exceptions=True)
-                for res in extra_res:
-                    if not isinstance(res, Exception) and res.status_code == 200:
-                        for it in res.json().get("Items", []):
-                            if it.get("Type") in ("Episode", "Movie", "Video"):
-                                items_map[it.get("Id")] = it
+                r1, r_series, r_person, r_genre, r_studio, all_tags = await asyncio.gather(*tasks, return_exceptions=True)
 
-            all_items = list(items_map.values())
+                items_map: Dict[str, Any] = {}
+                if not isinstance(r1, Exception) and r1.status_code == 200:
+                    for it in r1.json().get("Items", []):
+                        items_map[it.get("Id")] = it
+
+                series_ids: List[str] = []
+                if not isinstance(r_series, Exception) and r_series.status_code == 200:
+                    for s in r_series.json().get("Items", []):
+                        if s.get("Id"):
+                            series_ids.append(s.get("Id"))
+
+                person_ids: List[str] = []
+                if not isinstance(r_person, Exception) and r_person.status_code == 200:
+                    for p in r_person.json().get("Items", []):
+                        if p.get("Id"):
+                            person_ids.append(p.get("Id"))
+
+                genre_ids: List[str] = []
+                if not isinstance(r_genre, Exception) and r_genre.status_code == 200:
+                    for g in r_genre.json().get("Items", []):
+                        if g.get("Id"):
+                            genre_ids.append(g.get("Id"))
+
+                studio_ids: List[str] = []
+                if not isinstance(r_studio, Exception) and r_studio.status_code == 200:
+                    for s in r_studio.json().get("Items", []):
+                        if s.get("Id"):
+                            studio_ids.append(s.get("Id"))
+
+                matched_tags: List[str] = []
+                if isinstance(all_tags, list):
+                    for tag in all_tags:
+                        if search_lower in tag.lower() or tag.lower() in search_lower:
+                            matched_tags.append(tag)
+
+                extra_tasks = []
+                # シリーズエピソードは話数上限を設けない（全エピソード漏れなく取得）
+                episode_params = {"fields": base_fields}
+                if user_id:
+                    episode_params["userId"] = user_id
+
+                for sid in series_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
+                            params=episode_params,
+                            headers=headers
+                        )
+                    )
+
+                if person_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+                if genre_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+                if studio_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+                if matched_tags:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+
+                if extra_tasks:
+                    extra_res = await asyncio.gather(*extra_tasks, return_exceptions=True)
+                    for res in extra_res:
+                        if not isinstance(res, Exception) and res.status_code == 200:
+                            for it in res.json().get("Items", []):
+                                if it.get("Type") in ("Episode", "Movie", "Video"):
+                                    items_map[it.get("Id")] = it
+
+                all_items = list(items_map.values())
 
             def natural_sort_key(s: str):
                 return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s or "")]
@@ -1708,7 +1930,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       <div class="controls-wrapper">
         <div class="search-bar">
           <span class="search-icon">🔍</span>
-          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" autocomplete="off">
+          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" title="検索のヒント: series:シリーズ名, actor:出演者, genre:ジャンル, studio:スタジオ, tag:タグ, item:動画名。スペース区切りでAND検索も可能" autocomplete="off">
           <button id="clearBtn" class="clear-btn" title="クリア">✕</button>
         </div>
 
