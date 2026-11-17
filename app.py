@@ -811,13 +811,18 @@ async def search_items(
 
             people = it.get("People", []) or []
             actors = []
+            seen_actor_names = set()
             for p in people:
                 p_type = p.get("Type", "")
                 p_role = p.get("Role", "")
                 if p_type == "Actor" or (p_role and p_role.lower() == "actor"):
                     p_name = p.get("Name")
-                    if p_name and p_name not in actors:
-                        actors.append(p_name)
+                    if p_name and p_name not in seen_actor_names:
+                        seen_actor_names.add(p_name)
+                        actors.append({
+                            "name": p_name,
+                            "role": p_role if (p_role and p_role.lower() != "actor") else ""
+                        })
 
             parent_idx = it.get("ParentIndexNumber")
             idx = it.get("IndexNumber")
@@ -948,11 +953,22 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         item_dto["Genres"] = cleaned_genres
 
     if payload.actors is not None:
-        cleaned_actor_names = []
+        parsed_actors = []
+        seen_names = set()
         for a in payload.actors:
             a = a.strip()
-            if a and a not in cleaned_actor_names:
-                cleaned_actor_names.append(a)
+            if not a:
+                continue
+            if ":" in a:
+                a_name, a_role = a.split(":", 1)
+                a_name = a_name.strip()
+                a_role = a_role.strip()
+            else:
+                a_name = a
+                a_role = ""
+            if a_name and a_name not in seen_names:
+                seen_names.add(a_name)
+                parsed_actors.append((a_name, a_role))
 
         existing_people = item_dto.get("People") or []
         # 監督・脚本など非Actorの役職はそのまま保持
@@ -962,17 +978,17 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         ]
 
         new_actor_people = []
-        for a_name in cleaned_actor_names:
+        for a_name, a_role in parsed_actors:
             existing_p = next((p for p in existing_people if p.get("Name") == a_name), None)
             if existing_p:
                 p_dict = dict(existing_p)
                 p_dict["Type"] = "Actor"
-                p_dict["Role"] = "Actor"
+                p_dict["Role"] = a_role
                 new_actor_people.append(p_dict)
             else:
                 new_actor_people.append({
                     "Name": a_name,
-                    "Role": "Actor",
+                    "Role": a_role,
                     "Type": "Actor"
                 })
 
@@ -1039,11 +1055,17 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             premiere_date_str = ""
 
         updated_actors = []
+        seen_updated = set()
         for p in item_dto.get("People", []):
             if p.get("Type") == "Actor" or (p.get("Role") or "").lower() == "actor":
                 p_name = p.get("Name")
-                if p_name and p_name not in updated_actors:
-                    updated_actors.append(p_name)
+                p_role = p.get("Role", "")
+                if p_name and p_name not in seen_updated:
+                    seen_updated.add(p_name)
+                    updated_actors.append({
+                        "name": p_name,
+                        "role": p_role if (p_role and p_role.lower() != "actor") else ""
+                    })
 
         return {
             "status": "ok",
@@ -2215,9 +2237,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <div class="form-group">
           <div class="form-label">
             <span>👤 出演者 (Actors)</span>
-            <span class="form-label-hint">カンマ区切り (Role: Actor)</span>
+            <span class="form-label-hint">カンマ区切り (名前:役名)</span>
           </div>
-          <input type="text" id="editActorsInput" class="form-input" placeholder="例: タモリ, 山田太郎">
+          <input type="text" id="editActorsInput" class="form-input" placeholder="例: 田村正和:古畑任三郎, 西村雅彦:今泉慎太郎">
         </div>
       </div>
 
@@ -2562,7 +2584,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       let actorsHtml = '';
       if (item.actors && item.actors.length > 0) {
         actorsHtml = `<div class="card-actors">` + 
-          item.actors.map(a => `<span class="actor-badge" data-actor="${escapeHtml(a)}" title="この出演者で検索">👤 ${escapeHtml(a)}</span>`).join('') +
+          item.actors.map(a => {
+            const name = (typeof a === 'object' && a !== null) ? (a.name || '') : String(a);
+            const role = (typeof a === 'object' && a !== null && a.role && a.role.toLowerCase() !== 'actor') ? a.role : '';
+            const display = role ? `${name} (${role})` : name;
+            return `<span class="actor-badge" data-actor="${escapeHtml(name)}" title="この出演者で検索: ${escapeHtml(name)}">👤 ${escapeHtml(display)}</span>`;
+          }).join('') +
           `</div>`;
       }
 
@@ -2621,7 +2648,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       editNameInput.value = item.name || '';
       editPremiereDateInput.value = item.premiere_date || '';
       editGenresInput.value = (item.genres || []).join(', ');
-      editActorsInput.value = (item.actors || []).join(', ');
+      editActorsInput.value = (item.actors || []).map(a => {
+        if (typeof a === 'object' && a !== null) {
+          const role = (a.role && a.role.toLowerCase() !== 'actor') ? a.role : '';
+          return role ? `${a.name}:${role}` : a.name;
+        }
+        return a;
+      }).join(', ');
       editTagsInput.value = (item.tags || []).join(', ');
       editOverviewInput.value = item.overview || '';
 
