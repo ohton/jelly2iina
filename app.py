@@ -1,11 +1,14 @@
 import os
 import re
+import shlex
 import urllib.parse
 import base64
 import asyncio
 import random
 import time
-from typing import Optional, List, Dict, Any, Set
+import logging
+from logging.handlers import RotatingFileHandler
+from typing import Optional, List, Dict, Any, Set, Tuple
 from contextlib import asynccontextmanager
 
 import httpx
@@ -15,6 +18,32 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "http://localhost:8096").rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "").strip()
+
+# ログ永続化設定 (/app/logs -> ホスト側 ./logs にマウント)
+LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+logger = logging.getLogger("jelly2iina")
+logger.setLevel(logging.INFO)
+
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=20 * 1024 * 1024,  # 20MB
+        backupCount=10,
+        encoding="utf-8"
+    )
+    file_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    # uvicornのアクセスログ・エラーログも同じファイルへ集約・永続化
+    logging.getLogger("uvicorn.access").addHandler(file_handler)
+    logging.getLogger("uvicorn.error").addHandler(file_handler)
 
 # HTTPクライアントの寿命管理
 http_client: Optional[httpx.AsyncClient] = None
@@ -26,8 +55,10 @@ last_tags_fetch: float = 0.0
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
+    logger.info(f"jellyfin-iina-bridge starting... JELLYFIN_URL={JELLYFIN_URL}")
     http_client = httpx.AsyncClient(timeout=15.0)
     yield
+    logger.info("jellyfin-iina-bridge shutting down...")
     await http_client.aclose()
 
 app = FastAPI(title="jelly2iina", version="1.0.0", lifespan=lifespan)
@@ -246,6 +277,232 @@ SORT_CONFIG = {
     "random": ("Random", "Ascending"),
 }
 
+VALID_SEARCH_PREFIXES = {"item", "series", "actor", "genre", "studio", "tag"}
+
+def parse_search_query(q: str) -> Tuple[bool, List[Tuple[bool, str, str]]]:
+    """
+    クエリ文字列をパースし、(is_explicit, filters) を返す。
+    filters は [(is_not, prefix, term), ...] のリスト。
+    """
+    q_str = q.strip()
+    if not q_str:
+        return False, []
+    try:
+        tokens = shlex.split(q_str)
+    except ValueError:
+        tokens = q_str.split()
+
+    if not tokens:
+        return False, []
+
+    parsed: List[Tuple[bool, str, str]] = []
+    has_explicit_filter = False
+
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        
+        is_not = False
+        if token.startswith("-") and len(token) > 1:
+            is_not = True
+            token = token[1:].strip()
+            has_explicit_filter = True
+        elif token.startswith("!") and len(token) > 1:
+            is_not = True
+            token = token[1:].strip()
+            has_explicit_filter = True
+
+        if ":" in token:
+            prefix, val = token.split(":", 1)
+            p_lower = prefix.lower()
+            if p_lower in VALID_SEARCH_PREFIXES and val:
+                has_explicit_filter = True
+                parsed.append((is_not, p_lower, val))
+                continue
+        
+        parsed.append((is_not, "item", token))
+
+    return has_explicit_filter, parsed
+
+async def fetch_filter_items(
+    prefix: str,
+    val: str,
+    base_params: Dict[str, Any],
+    headers: Dict[str, str],
+    user_id: Optional[str]
+) -> Dict[str, Any]:
+    items_map: Dict[str, Any] = {}
+    val_lower = val.lower()
+
+    if prefix == "item":
+        try:
+            r = await http_client.get(
+                f"{JELLYFIN_URL}/Items",
+                params={**base_params, "searchTerm": val, "limit": 2000},
+                headers=headers
+            )
+            if r.status_code == 200:
+                for it in r.json().get("Items", []):
+                    if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                        items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "series":
+        try:
+            r_series = await http_client.get(
+                f"{JELLYFIN_URL}/Items",
+                params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": val, "limit": 50},
+                headers=headers
+            )
+            series_ids = []
+            if r_series.status_code == 200:
+                for s in r_series.json().get("Items", []):
+                    if s.get("Id"):
+                        series_ids.append(s["Id"])
+            
+            if series_ids:
+                episode_params = {"fields": base_params.get("fields", "")}
+                if user_id:
+                    episode_params["userId"] = user_id
+                
+                ep_tasks = [
+                    http_client.get(
+                        f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
+                        params=episode_params,
+                        headers=headers
+                    )
+                    for sid in series_ids
+                ]
+                ep_res = await asyncio.gather(*ep_tasks, return_exceptions=True)
+                for res in ep_res:
+                    if not isinstance(res, Exception) and res.status_code == 200:
+                        for it in res.json().get("Items", []):
+                            if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                                items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "actor":
+        try:
+            r_person = await http_client.get(
+                f"{JELLYFIN_URL}/Persons",
+                params={"searchTerm": val, "limit": 30},
+                headers=headers
+            )
+            person_ids = []
+            if r_person.status_code == 200:
+                for p in r_person.json().get("Items", []):
+                    if p.get("Id"):
+                        person_ids.append(p["Id"])
+            
+            if person_ids:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "genre":
+        try:
+            # 1. ジャンル名そのもので直接検索 (Jellyfin の genres パラメータ)
+            # 手動追加や未インデックスのカスタムジャンルも確実にヒットする
+            tasks = [
+                http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "genres": val, "limit": 2000},
+                    headers=headers,
+                ),
+                http_client.get(
+                    f"{JELLYFIN_URL}/Genres",
+                    params={"searchTerm": val, "limit": 20},
+                    headers=headers,
+                ),
+            ]
+            r_items_direct, r_genre = await asyncio.gather(*tasks, return_exceptions=True)
+
+            if not isinstance(r_items_direct, Exception) and r_items_direct.status_code == 200:
+                for it in r_items_direct.json().get("Items", []):
+                    if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                        items_map[it["Id"]] = it
+
+            # 2. 既存のジャンルエンティティID経由でも検索（前方一致・部分一致ジャンルの補完）
+            genre_ids = []
+            if not isinstance(r_genre, Exception) and r_genre.status_code == 200:
+                for g in r_genre.json().get("Items", []):
+                    if g.get("Id"):
+                        genre_ids.append(g["Id"])
+
+            if genre_ids:
+                r_items_by_id = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                    headers=headers,
+                )
+                if r_items_by_id.status_code == 200:
+                    for it in r_items_by_id.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "studio":
+        try:
+            r_studio = await http_client.get(
+                f"{JELLYFIN_URL}/Studios",
+                params={"searchTerm": val, "limit": 30},
+                headers=headers
+            )
+            studio_ids = []
+            if r_studio.status_code == 200:
+                for s in r_studio.json().get("Items", []):
+                    if s.get("Id"):
+                        studio_ids.append(s["Id"])
+            
+            if studio_ids:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    elif prefix == "tag":
+        try:
+            all_tags = await get_all_tags()
+            matched_tags = []
+            if isinstance(all_tags, list):
+                for tag in all_tags:
+                    if val_lower in tag.lower() or tag.lower() in val_lower:
+                        matched_tags.append(tag)
+            
+            if matched_tags:
+                r_items = await http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                    headers=headers
+                )
+                if r_items.status_code == 200:
+                    for it in r_items.json().get("Items", []):
+                        if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                            items_map[it["Id"]] = it
+        except Exception:
+            pass
+
+    return items_map
+
 @app.get("/api/search")
 async def search_items(
     q: Optional[str] = Query(None, description="Search term"),
@@ -264,12 +521,12 @@ async def search_items(
     server_os = await detect_server_os()
     user_id = await get_current_user_id()
 
-    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData"
+    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData,OriginalTitle"
 
     try:
         if q and q.strip():
             search_term = q.strip()
-            search_lower = search_term.lower()
+            is_explicit, parsed_filters = parse_search_query(search_term)
             base_params = {
                 "recursive": "true",
                 "includeItemTypes": "Movie,Episode,Video",
@@ -278,135 +535,220 @@ async def search_items(
             if user_id:
                 base_params["userId"] = user_id
 
-            tasks = [
-                # 1. 通常のアイテム検索 (上限を大きく拡大)
-                http_client.get(
-                    f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "searchTerm": search_term, "limit": 2000},
-                    headers=headers
-                ),
-                # 2. シリーズ (Series) 自体の検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Items",
-                    params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": search_term, "limit": 50},
-                    headers=headers
-                ),
-                # 3. 出演者検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Persons",
-                    params={"searchTerm": search_term, "limit": 30},
-                    headers=headers
-                ),
-                # 4. ジャンル検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Genres",
-                    params={"searchTerm": search_term, "limit": 20},
-                    headers=headers
-                ),
-                # 5. スタジオ検索
-                http_client.get(
-                    f"{JELLYFIN_URL}/Studios",
-                    params={"searchTerm": search_term, "limit": 30},
-                    headers=headers
-                ),
-                # 6. タグ一覧取得
-                get_all_tags(),
-            ]
+            if is_explicit:
+                # 明示的プレフィックス検索 / AND・NOT検索モード
+                positive_filters = [(p, v) for is_not, p, v in parsed_filters if not is_not]
+                negative_filters = [(p, v) for is_not, p, v in parsed_filters if is_not]
 
-            r1, r_series, r_person, r_genre, r_studio, all_tags = await asyncio.gather(*tasks, return_exceptions=True)
+                # すべてのフィルタ取得タスクを並列生成
+                tasks = [
+                    fetch_filter_items(p, v, base_params, headers, user_id)
+                    for p, v in (positive_filters + negative_filters)
+                ]
 
-            items_map: Dict[str, Any] = {}
-            if not isinstance(r1, Exception) and r1.status_code == 200:
-                for it in r1.json().get("Items", []):
-                    items_map[it.get("Id")] = it
-
-            series_ids: List[str] = []
-            if not isinstance(r_series, Exception) and r_series.status_code == 200:
-                for s in r_series.json().get("Items", []):
-                    if s.get("Id"):
-                        series_ids.append(s.get("Id"))
-
-            person_ids: List[str] = []
-            if not isinstance(r_person, Exception) and r_person.status_code == 200:
-                for p in r_person.json().get("Items", []):
-                    if p.get("Id"):
-                        person_ids.append(p.get("Id"))
-
-            genre_ids: List[str] = []
-            if not isinstance(r_genre, Exception) and r_genre.status_code == 200:
-                for g in r_genre.json().get("Items", []):
-                    if g.get("Id"):
-                        genre_ids.append(g.get("Id"))
-
-            studio_ids: List[str] = []
-            if not isinstance(r_studio, Exception) and r_studio.status_code == 200:
-                for s in r_studio.json().get("Items", []):
-                    if s.get("Id"):
-                        studio_ids.append(s.get("Id"))
-
-            matched_tags: List[str] = []
-            if isinstance(all_tags, list):
-                for tag in all_tags:
-                    if search_lower in tag.lower() or tag.lower() in search_lower:
-                        matched_tags.append(tag)
-
-            extra_tasks = []
-            # シリーズエピソードは話数上限を設けない（全エピソード漏れなく取得）
-            episode_params = {"fields": base_fields}
-            if user_id:
-                episode_params["userId"] = user_id
-
-            for sid in series_ids:
-                extra_tasks.append(
-                    http_client.get(
-                        f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
-                        params=episode_params,
-                        headers=headers
+                # 正の条件がなく、NOT条件のみ指定された場合（案1: ライブラリ全件をベース集合とする）
+                need_base_fetch = len(positive_filters) == 0
+                if need_base_fetch:
+                    tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={
+                                **base_params,
+                                "sortBy": sort_field,
+                                "sortOrder": sort_order,
+                                "limit": 500
+                            },
+                            headers=headers
+                        )
                     )
-                )
 
-            if person_ids:
-                extra_tasks.append(
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                num_pos = len(positive_filters)
+                num_neg = len(negative_filters)
+
+                pos_results = results[:num_pos]
+                neg_results = results[num_pos:num_pos + num_neg]
+
+                items_pool: Dict[str, Any] = {}
+                positive_ids: Optional[Set[str]] = None
+
+                if need_base_fetch:
+                    base_res = results[-1]
+                    base_ids: Set[str] = set()
+                    if not isinstance(base_res, Exception) and base_res.status_code == 200:
+                        for it in base_res.json().get("Items", []):
+                            if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                                iid = it["Id"]
+                                items_pool[iid] = it
+                                base_ids.add(iid)
+                    positive_ids = base_ids
+                else:
+                    for res in pos_results:
+                        if isinstance(res, Exception):
+                            res = {}
+                        items_pool.update(res)
+                        ids = set(res.keys())
+                        if positive_ids is None:
+                            positive_ids = ids
+                        else:
+                            positive_ids = positive_ids.intersection(ids)
+
+                if positive_ids is None:
+                    positive_ids = set()
+
+                # ネガティブ条件（NOT）でヒットした除外対象アイテムIDを収集
+                excluded_ids: Set[str] = set()
+                for res in neg_results:
+                    if isinstance(res, Exception):
+                        continue
+                    excluded_ids.update(res.keys())
+
+                # 差集合判定 (正の集合 - 除外集合)
+                final_ids = positive_ids - excluded_ids
+                all_items = [items_pool[iid] for iid in final_ids if iid in items_pool]
+            else:
+                # 従来の横断検索モード (6系統の並列取得 & 和集合 OR 集約)
+                search_lower = search_term.lower()
+                tasks = [
+                    # 1. 通常のアイテム検索 (上限を大きく拡大)
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                        params={**base_params, "searchTerm": search_term, "limit": 2000},
                         headers=headers
-                    )
-                )
-            if genre_ids:
-                extra_tasks.append(
+                    ),
+                    # 2. シリーズ (Series) 自体の検索
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                        params={"recursive": "true", "includeItemTypes": "Series", "searchTerm": search_term, "limit": 50},
                         headers=headers
-                    )
-                )
-            if studio_ids:
-                extra_tasks.append(
+                    ),
+                    # 3. 出演者検索
+                    http_client.get(
+                        f"{JELLYFIN_URL}/Persons",
+                        params={"searchTerm": search_term, "limit": 30},
+                        headers=headers
+                    ),
+                    # 4. ジャンル検索 (ID取得用)
+                    http_client.get(
+                        f"{JELLYFIN_URL}/Genres",
+                        params={"searchTerm": search_term, "limit": 20},
+                        headers=headers
+                    ),
+                    # 4-2. ジャンル名直接検索 (手動追加ジャンル用)
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                        params={**base_params, "genres": search_term, "limit": 2000},
                         headers=headers
-                    )
-                )
-            if matched_tags:
-                extra_tasks.append(
+                    ),
+                    # 5. スタジオ検索
                     http_client.get(
-                        f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                        f"{JELLYFIN_URL}/Studios",
+                        params={"searchTerm": search_term, "limit": 30},
                         headers=headers
-                    )
-                )
+                    ),
+                    # 6. タグ一覧取得
+                    get_all_tags(),
+                ]
 
-            if extra_tasks:
-                extra_res = await asyncio.gather(*extra_tasks, return_exceptions=True)
-                for res in extra_res:
-                    if not isinstance(res, Exception) and res.status_code == 200:
-                        for it in res.json().get("Items", []):
-                            if it.get("Type") in ("Episode", "Movie", "Video"):
-                                items_map[it.get("Id")] = it
+                r1, r_series, r_person, r_genre, r_genre_direct, r_studio, all_tags = await asyncio.gather(*tasks, return_exceptions=True)
 
-            all_items = list(items_map.values())
+                items_map: Dict[str, Any] = {}
+                if not isinstance(r1, Exception) and r1.status_code == 200:
+                    for it in r1.json().get("Items", []):
+                        items_map[it.get("Id")] = it
+
+                if not isinstance(r_genre_direct, Exception) and r_genre_direct.status_code == 200:
+                    for it in r_genre_direct.json().get("Items", []):
+                        items_map[it.get("Id")] = it
+
+                series_ids: List[str] = []
+                if not isinstance(r_series, Exception) and r_series.status_code == 200:
+                    for s in r_series.json().get("Items", []):
+                        if s.get("Id"):
+                            series_ids.append(s.get("Id"))
+
+                person_ids: List[str] = []
+                if not isinstance(r_person, Exception) and r_person.status_code == 200:
+                    for p in r_person.json().get("Items", []):
+                        if p.get("Id"):
+                            person_ids.append(p.get("Id"))
+
+                genre_ids: List[str] = []
+                if not isinstance(r_genre, Exception) and r_genre.status_code == 200:
+                    for g in r_genre.json().get("Items", []):
+                        if g.get("Id"):
+                            genre_ids.append(g.get("Id"))
+
+                studio_ids: List[str] = []
+                if not isinstance(r_studio, Exception) and r_studio.status_code == 200:
+                    for s in r_studio.json().get("Items", []):
+                        if s.get("Id"):
+                            studio_ids.append(s.get("Id"))
+
+                matched_tags: List[str] = []
+                if isinstance(all_tags, list):
+                    for tag in all_tags:
+                        if search_lower in tag.lower() or tag.lower() in search_lower:
+                            matched_tags.append(tag)
+
+                extra_tasks = []
+                # シリーズエピソードは話数上限を設けない（全エピソード漏れなく取得）
+                episode_params = {"fields": base_fields}
+                if user_id:
+                    episode_params["userId"] = user_id
+
+                for sid in series_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Shows/{sid}/Episodes",
+                            params=episode_params,
+                            headers=headers
+                        )
+                    )
+
+                if person_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+                if genre_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+                if studio_ids:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+                if matched_tags:
+                    extra_tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                            headers=headers
+                        )
+                    )
+
+                if extra_tasks:
+                    extra_res = await asyncio.gather(*extra_tasks, return_exceptions=True)
+                    for res in extra_res:
+                        if not isinstance(res, Exception) and res.status_code == 200:
+                            for it in res.json().get("Items", []):
+                                if it.get("Type") in ("Episode", "Movie", "Video"):
+                                    items_map[it.get("Id")] = it
+
+                all_items = list(items_map.values())
 
             def natural_sort_key(s: str):
                 return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s or "")]
@@ -526,13 +868,18 @@ async def search_items(
 
             people = it.get("People", []) or []
             actors = []
+            seen_actor_names = set()
             for p in people:
                 p_type = p.get("Type", "")
                 p_role = p.get("Role", "")
                 if p_type == "Actor" or (p_role and p_role.lower() == "actor"):
                     p_name = p.get("Name")
-                    if p_name and p_name not in actors:
-                        actors.append(p_name)
+                    if p_name and p_name not in seen_actor_names:
+                        seen_actor_names.add(p_name)
+                        actors.append({
+                            "name": p_name,
+                            "role": p_role if (p_role and p_role.lower() != "actor") else ""
+                        })
 
             parent_idx = it.get("ParentIndexNumber")
             idx = it.get("IndexNumber")
@@ -559,6 +906,7 @@ async def search_items(
                 "path": path,
                 "server_os": srv_os,
                 "stream_url": stream_url,
+                "jellyfin_url": f"{JELLYFIN_URL}/web/index.html#!/details?id={item_id}",
                 "iina_file_url": iina_file,
                 "iina_stream_url": iina_stream,
                 "mpv_file_url": mpv_file,
@@ -571,9 +919,11 @@ async def search_items(
                 "user_rating": round(user_rating, 1) if user_rating is not None else None,
                 "premiere_date": it.get("PremiereDate", "")[:10] if it.get("PremiereDate") else "",
                 "tags": tags[:12],
-                "actors": actors[:8],
+                "genres": it.get("Genres", []) or [],
+                "actors": actors,
                 "studios": studios[:2],
                 "year": it.get("ProductionYear"),
+                "original_title": it.get("OriginalTitle") or "",
                 "overview": it.get("Overview", ""),
             })
 
@@ -592,10 +942,26 @@ class MetadataUpdateRequest(BaseModel):
     user_rating: Optional[float] = None
     clear_user_rating: Optional[bool] = False
     name: Optional[str] = None
+    original_title: Optional[str] = None
     overview: Optional[str] = None
     tags: Optional[List[str]] = None
+    genres: Optional[List[str]] = None
+    actors: Optional[List[str]] = None
     premiere_date: Optional[str] = None
     clear_premiere_date: Optional[bool] = False
+
+# 全てのItemFieldsを列挙して取得時に未編集フィールド（原題OriginalTitle, ProviderIds, SortName等）がPOST更新で消去されるのを防止
+# (※ Trickplay はJellyfinのPOST更新時に内部型エラーを引き起こすため除外)
+ALL_UPDATE_FIELDS = (
+    "AirTime,CanDelete,CanDownload,ChannelInfo,Chapters,ChildCount,"
+    "CumulativeRunTimeTicks,CustomRating,DateCreated,DateLastMediaAdded,DisplayPreferencesId,"
+    "Etag,ExternalUrls,Genres,ItemCounts,MediaSourceCount,MediaSources,OriginalTitle,Overview,"
+    "ParentId,Path,People,PlayAccess,ProductionLocations,ProviderIds,PrimaryImageAspectRatio,"
+    "RecursiveItemCount,Settings,SeriesStudio,SortName,SpecialEpisodeNumbers,Studios,Taglines,Tags,"
+    "RemoteTrailers,MediaStreams,SeasonUserData,DateLastRefreshed,DateLastSaved,RefreshState,"
+    "ChannelImage,EnableMediaSourceDisplay,Width,Height,ExtraIds,LocalTrailerCount,IsHD,SpecialFeatureCount,"
+    "CommunityRating,PremiereDate,ProductionYear"
+)
 
 @app.post("/api/items/{item_id}/metadata")
 async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
@@ -605,11 +971,11 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
     headers = get_auth_headers()
     user_id = await get_current_user_id()
 
-    # 1. 現在のアイテムオブジェクトを取得
+    # 1. 現在のアイテムオブジェクトを取得 (全フィールドを取得して未編集情報の欠落を防ぐ)
     try:
         fetch_params = {
             "ids": item_id,
-            "fields": "CommunityRating,Tags,Overview,Genres,Studios,PremiereDate,ProductionYear,UserData",
+            "fields": ALL_UPDATE_FIELDS,
         }
         if user_id:
             fetch_params["userId"] = user_id
@@ -626,6 +992,7 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         if not items:
             raise HTTPException(status_code=404, detail="Item not found")
         item_dto = items[0]
+        item_dto.pop("Trickplay", None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -638,6 +1005,9 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
     if payload.name is not None and payload.name.strip():
         item_dto["Name"] = payload.name.strip()
 
+    if payload.original_title is not None:
+        item_dto["OriginalTitle"] = payload.original_title.strip()
+
     if payload.overview is not None:
         item_dto["Overview"] = payload.overview.strip()
 
@@ -649,6 +1019,56 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
             if t and t not in cleaned_tags:
                 cleaned_tags.append(t)
         item_dto["Tags"] = cleaned_tags
+
+    if payload.genres is not None:
+        cleaned_genres = []
+        for g in payload.genres:
+            g = g.strip()
+            if g and g not in cleaned_genres:
+                cleaned_genres.append(g)
+        item_dto["Genres"] = cleaned_genres
+
+    if payload.actors is not None:
+        parsed_actors = []
+        seen_names = set()
+        for a in payload.actors:
+            a = a.strip()
+            if not a:
+                continue
+            if ":" in a:
+                a_name, a_role = a.split(":", 1)
+                a_name = a_name.strip()
+                a_role = a_role.strip()
+            else:
+                a_name = a
+                a_role = ""
+            if a_name and a_name not in seen_names:
+                seen_names.add(a_name)
+                parsed_actors.append((a_name, a_role))
+
+        existing_people = item_dto.get("People") or []
+        # 監督・脚本など非Actorの役職はそのまま保持
+        non_actor_people = [
+            p for p in existing_people
+            if p.get("Type") != "Actor" and (p.get("Role") or "").lower() != "actor"
+        ]
+
+        new_actor_people = []
+        for a_name, a_role in parsed_actors:
+            existing_p = next((p for p in existing_people if p.get("Name") == a_name), None)
+            if existing_p:
+                p_dict = dict(existing_p)
+                p_dict["Type"] = "Actor"
+                p_dict["Role"] = a_role
+                new_actor_people.append(p_dict)
+            else:
+                new_actor_people.append({
+                    "Name": a_name,
+                    "Role": a_role,
+                    "Type": "Actor"
+                })
+
+        item_dto["People"] = non_actor_people + new_actor_people
 
     if payload.clear_premiere_date:
         item_dto["PremiereDate"] = None
@@ -710,21 +1130,157 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         else:
             premiere_date_str = ""
 
+        updated_actors = []
+        seen_updated = set()
+        for p in item_dto.get("People", []):
+            if p.get("Type") == "Actor" or (p.get("Role") or "").lower() == "actor":
+                p_name = p.get("Name")
+                p_role = p.get("Role", "")
+                if p_name and p_name not in seen_updated:
+                    seen_updated.add(p_name)
+                    updated_actors.append({
+                        "name": p_name,
+                        "role": p_role if (p_role and p_role.lower() != "actor") else ""
+                    })
+
+        logger.info(
+            f"[METADATA_UPDATED] item_id={item_id} | name='{item_dto.get('Name')}' | orig='{item_dto.get('OriginalTitle')}' | tags={item_dto.get('Tags')} | genres={item_dto.get('Genres')} | actors={len(updated_actors)}"
+        )
+
         return {
             "status": "ok",
             "id": item_id,
             "rating": item_dto.get("CommunityRating"),
             "user_rating": updated_user_rating,
             "name": item_dto.get("Name"),
+            "original_title": item_dto.get("OriginalTitle") or "",
             "tags": item_dto.get("Tags", []),
+            "genres": item_dto.get("Genres", []),
+            "actors": updated_actors,
             "overview": item_dto.get("Overview", ""),
             "premiere_date": premiere_date_str,
             "year": item_dto.get("ProductionYear"),
         }
     except Exception as e:
+        logger.error(f"[METADATA_UPDATE_FAILED] item_id={item_id} | error={e}")
         raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
+
+
+PLAYLIST_NAME = "jelly2iina"
+
+
+@app.post("/api/playlist/jelly2iina/add")
+async def add_to_jelly2iina_playlist(item_id: str):
+    if not JELLYFIN_API_KEY:
+        raise HTTPException(status_code=500, detail="JELLYFIN_API_KEY is not configured.")
+
+    user_id = await get_current_user_id()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Could not determine Jellyfin User ID.")
+
+    headers = get_auth_headers()
+    post_headers = {**headers, "Content-Type": "application/json"}
+
+    try:
+        # 1. 既存のプレイリスト一覧を取得して "jelly2iina" を検索
+        res = await http_client.get(
+            f"{JELLYFIN_URL}/Users/{user_id}/Items",
+            params={"includeItemTypes": "Playlist", "recursive": "true"},
+            headers=headers,
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch playlists: {res.text}")
+
+        playlists = res.json().get("Items", [])
+        target_playlist = next((p for p in playlists if p.get("Name") == PLAYLIST_NAME), None)
+
+        if not target_playlist:
+            # 2. プレイリストが存在しない場合は新規作成（item_id を初期アイテムとして含める）
+            create_payload = {
+                "Name": PLAYLIST_NAME,
+                "Ids": [item_id],
+                "UserId": user_id,
+                "MediaType": "Video",
+            }
+            create_res = await http_client.post(
+                f"{JELLYFIN_URL}/Playlists",
+                json=create_payload,
+                headers=post_headers,
+            )
+            if create_res.status_code not in (200, 201):
+                # クエリパラメータ方式でも試行
+                create_res = await http_client.post(
+                    f"{JELLYFIN_URL}/Playlists",
+                    params={"name": PLAYLIST_NAME, "ids": item_id, "userId": user_id, "mediaType": "Video"},
+                    headers=post_headers,
+                )
+            if create_res.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=create_res.status_code,
+                    detail=f"Failed to create playlist: {create_res.text}",
+                )
+
+            created_data = create_res.json() if create_res.text else {}
+            playlist_id = created_data.get("Id")
+            logger.info(f"[PLAYLIST_CREATED] Created '{PLAYLIST_NAME}' ({playlist_id}) with item={item_id}")
+            return {
+                "status": "added",
+                "action": "created",
+                "playlist_id": playlist_id,
+                "message": f"プレイリスト '{PLAYLIST_NAME}' を作成し、追加しました",
+            }
+
+        playlist_id = target_playlist.get("Id")
+
+        # 3. 存在する場合は重複チェック
+        items_res = await http_client.get(
+            f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+            params={"userId": user_id, "fields": "BasicSyncInfo"},
+            headers=headers,
+        )
+        if items_res.status_code == 200:
+            items_data = items_res.json().get("Items", [])
+            existing_ids = {it.get("Id") for it in items_data}
+            if item_id in existing_ids:
+                return {
+                    "status": "already_exists",
+                    "action": "none",
+                    "playlist_id": playlist_id,
+                    "message": f"既にプレイリスト '{PLAYLIST_NAME}' に追加されています",
+                }
+
+        # 4. アイテムを追加 (POST /Playlists/{playlist_id}/Items)
+        add_res = await http_client.post(
+            f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+            params={"ids": item_id, "userId": user_id},
+            headers=post_headers,
+        )
+        if add_res.status_code not in (200, 204):
+            # JSON形式でも試行
+            add_res = await http_client.post(
+                f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+                json={"Ids": [item_id]},
+                headers=post_headers,
+            )
+        if add_res.status_code not in (200, 204):
+            raise HTTPException(
+                status_code=add_res.status_code,
+                detail=f"Failed to add item to playlist: {add_res.text}",
+            )
+
+        logger.info(f"[PLAYLIST_ITEM_ADDED] Added item={item_id} to '{PLAYLIST_NAME}' ({playlist_id})")
+        return {
+            "status": "added",
+            "action": "appended",
+            "playlist_id": playlist_id,
+            "message": f"プレイリスト '{PLAYLIST_NAME}' に追加しました",
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
+        logger.error(f"[PLAYLIST_ERROR] item_id={item_id} | error={e}")
+        raise HTTPException(status_code=500, detail=f"Playlist operation failed: {str(e)}")
 
 SVG_PLACEHOLDER = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400" fill="#1e222d">
   <rect width="400" height="400" fill="#181b24"/>
@@ -1308,6 +1864,34 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       border-color: #10b981;
     }
 
+    .card-genres {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .genre-badge {
+      background: rgba(245, 158, 11, 0.12);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      font-size: 0.72rem;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: var(--transition);
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.2rem;
+    }
+
+    .genre-badge:hover {
+      background: #f59e0b;
+      color: #ffffff;
+      border-color: #f59e0b;
+    }
+
     .card-tags {
       display: flex;
       flex-wrap: wrap;
@@ -1410,6 +1994,20 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: #36425c;
     }
 
+    .jf-detail-btn {
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+
+    .jf-detail-btn:hover {
+      background: #36425c;
+      color: #a78bfa;
+      transform: translateY(-1px);
+    }
+
     .empty-state {
       text-align: center;
       padding: 4rem 1rem;
@@ -1462,7 +2060,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       background: var(--bg-card);
       border: 1px solid var(--border-color);
       border-radius: 16px;
-      max-width: 660px;
+      max-width: 900px;
       width: 100%;
       max-height: 92vh;
       overflow-y: auto;
@@ -1708,7 +2306,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       <div class="controls-wrapper">
         <div class="search-bar">
           <span class="search-icon">🔍</span>
-          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" autocomplete="off">
+          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" title="検索のヒント: series:シリーズ名, actor:出演者, genre:ジャンル, studio:スタジオ, tag:タグ, item:動画名。-tag:ホラー でNOT除外、スペース区切りでAND検索も可能" autocomplete="off">
           <button id="clearBtn" class="clear-btn" title="クリア">✕</button>
         </div>
 
@@ -1832,7 +2430,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- タイトル -->
+      <!-- 動画タイトル -->
       <div class="form-group">
         <div class="form-label">
           <span>動画タイトル</span>
@@ -1840,25 +2438,53 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <input type="text" id="editNameInput" class="form-input" placeholder="動画タイトル">
       </div>
 
-      <!-- 公開日 -->
-      <div class="form-group">
-        <div class="form-label">
-          <span>📅 公開日 (Premiere Date)</span>
-          <span class="form-label-hint">年/月/日 (ソート基準・年号表示に使用)</span>
+      <!-- 原題 & 公開日 (2カラム) -->
+      <div class="ratings-row">
+        <div class="form-group">
+          <div class="form-label">
+            <span>原題 (Original Title)</span>
+          </div>
+          <input type="text" id="editOriginalTitleInput" class="form-input" placeholder="原題">
         </div>
-        <div style="display:flex; gap:0.5rem; align-items:center;">
-          <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
-          <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.65rem 0.9rem; font-size:0.8rem; white-space:nowrap;" title="公開日を未設定にする">未設定にする</button>
+
+        <div class="form-group">
+          <div class="form-label">
+            <span>📅 公開日 (Premiere Date)</span>
+            <span class="form-label-hint">年/月/日</span>
+          </div>
+          <div style="display:flex; gap:0.5rem; align-items:center;">
+            <input type="date" id="editPremiereDateInput" class="form-input" style="flex:1;">
+            <button type="button" id="clearDateBtn" class="btn btn-secondary" style="padding:0.55rem 0.75rem; font-size:0.75rem; white-space:nowrap;" title="公開日を未設定にする">未設定</button>
+          </div>
         </div>
       </div>
 
-      <!-- タグ -->
+      <!-- ジャンル & タグ (2カラム) -->
+      <div class="ratings-row">
+        <div class="form-group">
+          <div class="form-label">
+            <span>🎭 ジャンル (Genres)</span>
+            <span class="form-label-hint">カンマ区切り</span>
+          </div>
+          <input type="text" id="editGenresInput" class="form-input" placeholder="例: アニメ, コメディ, SF">
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">
+            <span>🏷️ タグ (Tags)</span>
+            <span class="form-label-hint">カンマ区切りで複数指定</span>
+          </div>
+          <input type="text" id="editTagsInput" class="form-input" placeholder="例: アニメ, アクション, SF, ドラマ">
+        </div>
+      </div>
+
+      <!-- 出演者 -->
       <div class="form-group">
         <div class="form-label">
-          <span>タグ (Tags)</span>
-          <span class="form-label-hint">カンマ区切りで複数指定</span>
+          <span>👤 出演者 (Actors)</span>
+          <span class="form-label-hint">カンマ区切り (名前:役名)</span>
         </div>
-        <input type="text" id="editTagsInput" class="form-input" placeholder="例: アニメ, アクション, SF, ドラマ">
+        <input type="text" id="editActorsInput" class="form-input" placeholder="例: 田村正和:古畑任三郎, 西村雅彦:今泉慎太郎">
       </div>
 
       <!-- 概要 -->
@@ -1979,6 +2605,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const ratingDisplayVal = document.getElementById('ratingDisplayVal');
     const ratingSlider = document.getElementById('ratingSlider');
     const editNameInput = document.getElementById('editNameInput');
+    const editOriginalTitleInput = document.getElementById('editOriginalTitleInput');
+    const editGenresInput = document.getElementById('editGenresInput');
+    const editActorsInput = document.getElementById('editActorsInput');
     const editTagsInput = document.getElementById('editTagsInput');
     const editOverviewInput = document.getElementById('editOverviewInput');
     const editPremiereDateInput = document.getElementById('editPremiereDateInput');
@@ -2188,10 +2817,22 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       const epBadgeHtml = item.episode_badge ? `<span class="episode-tag">${item.episode_badge}</span>` : '';
       
+      let genresHtml = '';
+      if (item.genres && item.genres.length > 0) {
+        genresHtml = `<div class="card-genres">` + 
+          item.genres.map(g => `<span class="genre-badge" data-genre="${escapeHtml(g)}" title="このジャンルで検索: ${escapeHtml(g)}">🎭 ${escapeHtml(g)}</span>`).join('') +
+          `</div>`;
+      }
+
       let actorsHtml = '';
       if (item.actors && item.actors.length > 0) {
         actorsHtml = `<div class="card-actors">` + 
-          item.actors.map(a => `<span class="actor-badge" data-actor="${escapeHtml(a)}" title="この出演者で検索">👤 ${escapeHtml(a)}</span>`).join('') +
+          item.actors.map(a => {
+            const name = (typeof a === 'object' && a !== null) ? (a.name || '') : String(a);
+            const role = (typeof a === 'object' && a !== null && a.role && a.role.toLowerCase() !== 'actor') ? a.role : '';
+            const display = role ? `${name} (${role})` : name;
+            return `<span class="actor-badge" data-actor="${escapeHtml(name)}" title="この出演者で検索: ${escapeHtml(name)}">👤 ${escapeHtml(display)}</span>`;
+          }).join('') +
           `</div>`;
       }
 
@@ -2227,13 +2868,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               ${yearHtml}
             </div>
             <div class="card-title" title="${escapeHtml(item.name)}">${epBadgeHtml}${escapeHtml(item.name)}</div>
+            ${genresHtml}
             ${actorsHtml}
             ${tagsHtml}
             <div class="card-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path || 'パスなし')}</div>
             <div class="card-actions">
               ${playBtn}
+              <button class="btn btn-secondary playlist-add-btn" data-id="${item.id}" title="プレイリスト (jelly2iina) に追加">➕</button>
               <button class="btn btn-secondary copy-btn" data-path="${escapeHtml(item.path)}" title="ファイルパスをコピー">📋</button>
               <button class="btn btn-secondary copy-stream-btn" data-stream="${escapeHtml(item.stream_url)}" title="Direct Stream URLをコピー">🔗</button>
+              <a href="${escapeHtml(item.jellyfin_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-secondary jf-detail-btn" title="Jellyfinで詳細ページを開く (別タブ)">🌐</a>
             </div>
           </div>
         </div>
@@ -2247,7 +2891,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       editItemId.value = itemId;
       editNameInput.value = item.name || '';
+      editOriginalTitleInput.value = item.original_title || '';
       editPremiereDateInput.value = item.premiere_date || '';
+      editGenresInput.value = (item.genres || []).join(', ');
+      editActorsInput.value = (item.actors || []).map(a => {
+        if (typeof a === 'object' && a !== null) {
+          const role = (a.role && a.role.toLowerCase() !== 'actor') ? a.role : '';
+          return role ? `${a.name}:${role}` : a.name;
+        }
+        return a;
+      }).join(', ');
       editTagsInput.value = (item.tags || []).join(', ');
       editOverviewInput.value = item.overview || '';
 
@@ -2320,8 +2973,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const isCleared = ratingSlider.dataset.cleared === 'true';
       const ratingVal = isCleared ? null : parseFloat(ratingSlider.value);
       const nameVal = editNameInput.value.trim();
+      const originalTitleVal = editOriginalTitleInput.value.trim();
       const premiereDateVal = editPremiereDateInput.value;
       const isDateCleared = !premiereDateVal;
+      const genresVal = editGenresInput.value.split(',').map(s => s.trim()).filter(Boolean);
+      const actorsVal = editActorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
       const tagsVal = editTagsInput.value.split(',').map(s => s.trim()).filter(Boolean);
       const overviewVal = editOverviewInput.value.trim();
 
@@ -2335,6 +2991,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           community_rating: ratingVal,
           clear_rating: isCleared,
           name: nameVal,
+          original_title: originalTitleVal,
+          genres: genresVal,
+          actors: actorsVal,
           tags: tagsVal,
           overview: overviewVal,
           premiere_date: premiereDateVal,
@@ -2360,9 +3019,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const item = itemsCache.get(itemId);
         if (item) {
           item.name = data.name;
+          item.original_title = data.original_title || '';
           item.rating = data.rating !== null && data.rating !== undefined ? round(data.rating, 1) : null;
           item.user_rating = data.user_rating !== null && data.user_rating !== undefined ? round(data.user_rating, 1) : null;
           item.tags = data.tags || [];
+          item.genres = data.genres || [];
+          item.actors = data.actors || [];
           item.overview = data.overview || '';
           item.premiere_date = data.premiere_date || '';
           item.year = data.year;
@@ -2450,8 +3112,52 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       }
     }
 
+    // プレイリスト(jelly2iina)へ追加
+    async function addToPlaylist(itemId, btnElem) {
+      if (!itemId) return;
+      const originalText = btnElem ? btnElem.textContent : '';
+      if (btnElem) {
+        btnElem.disabled = true;
+        btnElem.textContent = '⏳';
+        btnElem.style.opacity = '0.7';
+      }
+      try {
+        const res = await fetch(`/api/playlist/jelly2iina/add?item_id=${encodeURIComponent(itemId)}`, {
+          method: 'POST'
+        });
+        const data = await res.json();
+        if (res.ok) {
+          if (data.status === 'already_exists') {
+            showToast(`ℹ️ ${data.message || '既にプレイリストに追加されています'}`);
+          } else {
+            showToast(`✅ ${data.message || 'プレイリストに追加しました'}`);
+          }
+        } else {
+          showToast(`❌ エラー: ${data.detail || '追加に失敗しました'}`);
+        }
+      } catch (err) {
+        showToast('❌ 通信エラーが発生しました');
+      } finally {
+        if (btnElem) {
+          btnElem.disabled = false;
+          btnElem.textContent = originalText || '➕';
+          btnElem.style.opacity = '1';
+        }
+      }
+    }
+
     // イベントリスナー
     videoGrid.addEventListener('click', (e) => {
+      // プレイリスト追加ボタン
+      const playlistBtn = e.target.closest('.playlist-add-btn');
+      if (playlistBtn) {
+        const id = playlistBtn.getAttribute('data-id');
+        if (id) {
+          addToPlaylist(id, playlistBtn);
+          return;
+        }
+      }
+
       // 編集ボタンまたは評価バッジのクリック
       const editBtn = e.target.closest('.card-edit-btn') || e.target.closest('.card-rating');
       if (editBtn) {
@@ -2481,14 +3187,25 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         return;
       }
 
+      function formatPrefixQuery(prefix, value) {
+        if (!value) return '';
+        const trimmed = value.trim();
+        if (trimmed.includes(' ') || trimmed.includes(':') || trimmed.includes('"')) {
+          const escaped = trimmed.replace(/"/g, '\\"');
+          return `${prefix}:"${escaped}"`;
+        }
+        return `${prefix}:${trimmed}`;
+      }
+
       // シリーズ名クリックによる絞り込み検索
       const seriesEl = e.target.closest('.card-series');
       if (seriesEl) {
         const series = seriesEl.getAttribute('data-series');
         if (series) {
-          searchInput.value = series;
+          const qVal = formatPrefixQuery('series', series);
+          searchInput.value = qVal;
           clearBtn.style.display = 'block';
-          currentQuery = series;
+          currentQuery = qVal;
           window.scrollTo({ top: 0, behavior: 'smooth' });
           resetAndReload();
           return;
@@ -2500,9 +3217,25 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       if (tagBadge) {
         const tag = tagBadge.getAttribute('data-tag');
         if (tag) {
-          searchInput.value = tag;
+          const qVal = formatPrefixQuery('tag', tag);
+          searchInput.value = qVal;
           clearBtn.style.display = 'block';
-          currentQuery = tag;
+          currentQuery = qVal;
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          resetAndReload();
+          return;
+        }
+      }
+
+      // ジャンルバッジクリックによる絞り込み検索
+      const genreBadge = e.target.closest('.genre-badge');
+      if (genreBadge) {
+        const genre = genreBadge.getAttribute('data-genre');
+        if (genre) {
+          const qVal = formatPrefixQuery('genre', genre);
+          searchInput.value = qVal;
+          clearBtn.style.display = 'block';
+          currentQuery = qVal;
           window.scrollTo({ top: 0, behavior: 'smooth' });
           resetAndReload();
           return;
@@ -2514,9 +3247,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       if (actorBadge) {
         const actor = actorBadge.getAttribute('data-actor');
         if (actor) {
-          searchInput.value = actor;
+          const qVal = formatPrefixQuery('actor', actor);
+          searchInput.value = qVal;
           clearBtn.style.display = 'block';
-          currentQuery = actor;
+          currentQuery = qVal;
           window.scrollTo({ top: 0, behavior: 'smooth' });
           resetAndReload();
           return;
