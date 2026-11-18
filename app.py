@@ -1138,6 +1138,123 @@ async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
         logger.error(f"[METADATA_UPDATE_FAILED] item_id={item_id} | error={e}")
         raise HTTPException(status_code=500, detail=f"Failed to update metadata: {str(e)}")
 
+
+PLAYLIST_NAME = "jelly2iina"
+
+
+@app.post("/api/playlist/jelly2iina/add")
+async def add_to_jelly2iina_playlist(item_id: str):
+    if not JELLYFIN_API_KEY:
+        raise HTTPException(status_code=500, detail="JELLYFIN_API_KEY is not configured.")
+
+    user_id = await get_current_user_id()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Could not determine Jellyfin User ID.")
+
+    headers = get_auth_headers()
+    post_headers = {**headers, "Content-Type": "application/json"}
+
+    try:
+        # 1. 既存のプレイリスト一覧を取得して "jelly2iina" を検索
+        res = await http_client.get(
+            f"{JELLYFIN_URL}/Users/{user_id}/Items",
+            params={"includeItemTypes": "Playlist", "recursive": "true"},
+            headers=headers,
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch playlists: {res.text}")
+
+        playlists = res.json().get("Items", [])
+        target_playlist = next((p for p in playlists if p.get("Name") == PLAYLIST_NAME), None)
+
+        if not target_playlist:
+            # 2. プレイリストが存在しない場合は新規作成（item_id を初期アイテムとして含める）
+            create_payload = {
+                "Name": PLAYLIST_NAME,
+                "Ids": [item_id],
+                "UserId": user_id,
+                "MediaType": "Video",
+            }
+            create_res = await http_client.post(
+                f"{JELLYFIN_URL}/Playlists",
+                json=create_payload,
+                headers=post_headers,
+            )
+            if create_res.status_code not in (200, 201):
+                # クエリパラメータ方式でも試行
+                create_res = await http_client.post(
+                    f"{JELLYFIN_URL}/Playlists",
+                    params={"name": PLAYLIST_NAME, "ids": item_id, "userId": user_id, "mediaType": "Video"},
+                    headers=post_headers,
+                )
+            if create_res.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=create_res.status_code,
+                    detail=f"Failed to create playlist: {create_res.text}",
+                )
+
+            created_data = create_res.json() if create_res.text else {}
+            playlist_id = created_data.get("Id")
+            logger.info(f"[PLAYLIST_CREATED] Created '{PLAYLIST_NAME}' ({playlist_id}) with item={item_id}")
+            return {
+                "status": "added",
+                "action": "created",
+                "playlist_id": playlist_id,
+                "message": f"プレイリスト '{PLAYLIST_NAME}' を作成し、追加しました",
+            }
+
+        playlist_id = target_playlist.get("Id")
+
+        # 3. 存在する場合は重複チェック
+        items_res = await http_client.get(
+            f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+            params={"userId": user_id, "fields": "BasicSyncInfo"},
+            headers=headers,
+        )
+        if items_res.status_code == 200:
+            items_data = items_res.json().get("Items", [])
+            existing_ids = {it.get("Id") for it in items_data}
+            if item_id in existing_ids:
+                return {
+                    "status": "already_exists",
+                    "action": "none",
+                    "playlist_id": playlist_id,
+                    "message": f"既にプレイリスト '{PLAYLIST_NAME}' に追加されています",
+                }
+
+        # 4. アイテムを追加 (POST /Playlists/{playlist_id}/Items)
+        add_res = await http_client.post(
+            f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+            params={"ids": item_id, "userId": user_id},
+            headers=post_headers,
+        )
+        if add_res.status_code not in (200, 204):
+            # JSON形式でも試行
+            add_res = await http_client.post(
+                f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+                json={"Ids": [item_id]},
+                headers=post_headers,
+            )
+        if add_res.status_code not in (200, 204):
+            raise HTTPException(
+                status_code=add_res.status_code,
+                detail=f"Failed to add item to playlist: {add_res.text}",
+            )
+
+        logger.info(f"[PLAYLIST_ITEM_ADDED] Added item={item_id} to '{PLAYLIST_NAME}' ({playlist_id})")
+        return {
+            "status": "added",
+            "action": "appended",
+            "playlist_id": playlist_id,
+            "message": f"プレイリスト '{PLAYLIST_NAME}' に追加しました",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[PLAYLIST_ERROR] item_id={item_id} | error={e}")
+        raise HTTPException(status_code=500, detail=f"Playlist operation failed: {str(e)}")
+
 SVG_PLACEHOLDER = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400" fill="#1e222d">
   <rect width="400" height="400" fill="#181b24"/>
   <circle cx="200" cy="180" r="40" fill="#2b3142"/>
@@ -2730,6 +2847,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             <div class="card-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path || 'パスなし')}</div>
             <div class="card-actions">
               ${playBtn}
+              <button class="btn btn-secondary playlist-add-btn" data-id="${item.id}" title="プレイリスト (jelly2iina) に追加">➕</button>
               <button class="btn btn-secondary copy-btn" data-path="${escapeHtml(item.path)}" title="ファイルパスをコピー">📋</button>
               <button class="btn btn-secondary copy-stream-btn" data-stream="${escapeHtml(item.stream_url)}" title="Direct Stream URLをコピー">🔗</button>
               <a href="${escapeHtml(item.jellyfin_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-secondary jf-detail-btn" title="Jellyfinで詳細ページを開く (別タブ)">🌐</a>
@@ -2967,8 +3085,52 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       }
     }
 
+    // プレイリスト(jelly2iina)へ追加
+    async function addToPlaylist(itemId, btnElem) {
+      if (!itemId) return;
+      const originalText = btnElem ? btnElem.textContent : '';
+      if (btnElem) {
+        btnElem.disabled = true;
+        btnElem.textContent = '⏳';
+        btnElem.style.opacity = '0.7';
+      }
+      try {
+        const res = await fetch(`/api/playlist/jelly2iina/add?item_id=${encodeURIComponent(itemId)}`, {
+          method: 'POST'
+        });
+        const data = await res.json();
+        if (res.ok) {
+          if (data.status === 'already_exists') {
+            showToast(`ℹ️ ${data.message || '既にプレイリストに追加されています'}`);
+          } else {
+            showToast(`✅ ${data.message || 'プレイリストに追加しました'}`);
+          }
+        } else {
+          showToast(`❌ エラー: ${data.detail || '追加に失敗しました'}`);
+        }
+      } catch (err) {
+        showToast('❌ 通信エラーが発生しました');
+      } finally {
+        if (btnElem) {
+          btnElem.disabled = false;
+          btnElem.textContent = originalText || '➕';
+          btnElem.style.opacity = '1';
+        }
+      }
+    }
+
     // イベントリスナー
     videoGrid.addEventListener('click', (e) => {
+      // プレイリスト追加ボタン
+      const playlistBtn = e.target.closest('.playlist-add-btn');
+      if (playlistBtn) {
+        const id = playlistBtn.getAttribute('data-id');
+        if (id) {
+          addToPlaylist(id, playlistBtn);
+          return;
+        }
+      }
+
       // 編集ボタンまたは評価バッジのクリック
       const editBtn = e.target.closest('.card-edit-btn') || e.target.closest('.card-rating');
       if (editBtn) {
