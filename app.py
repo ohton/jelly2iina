@@ -412,25 +412,42 @@ async def fetch_filter_items(
 
     elif prefix == "genre":
         try:
-            r_genre = await http_client.get(
-                f"{JELLYFIN_URL}/Genres",
-                params={"searchTerm": val, "limit": 20},
-                headers=headers
-            )
+            # 1. ジャンル名そのもので直接検索 (Jellyfin の genres パラメータ)
+            # 手動追加や未インデックスのカスタムジャンルも確実にヒットする
+            tasks = [
+                http_client.get(
+                    f"{JELLYFIN_URL}/Items",
+                    params={**base_params, "genres": val, "limit": 2000},
+                    headers=headers,
+                ),
+                http_client.get(
+                    f"{JELLYFIN_URL}/Genres",
+                    params={"searchTerm": val, "limit": 20},
+                    headers=headers,
+                ),
+            ]
+            r_items_direct, r_genre = await asyncio.gather(*tasks, return_exceptions=True)
+
+            if not isinstance(r_items_direct, Exception) and r_items_direct.status_code == 200:
+                for it in r_items_direct.json().get("Items", []):
+                    if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                        items_map[it["Id"]] = it
+
+            # 2. 既存のジャンルエンティティID経由でも検索（前方一致・部分一致ジャンルの補完）
             genre_ids = []
-            if r_genre.status_code == 200:
+            if not isinstance(r_genre, Exception) and r_genre.status_code == 200:
                 for g in r_genre.json().get("Items", []):
                     if g.get("Id"):
                         genre_ids.append(g["Id"])
-            
+
             if genre_ids:
-                r_items = await http_client.get(
+                r_items_by_id = await http_client.get(
                     f"{JELLYFIN_URL}/Items",
                     params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
-                    headers=headers
+                    headers=headers,
                 )
-                if r_items.status_code == 200:
-                    for it in r_items.json().get("Items", []):
+                if r_items_by_id.status_code == 200:
+                    for it in r_items_by_id.json().get("Items", []):
                         if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                             items_map[it["Id"]] = it
         except Exception:
@@ -612,10 +629,16 @@ async def search_items(
                         params={"searchTerm": search_term, "limit": 30},
                         headers=headers
                     ),
-                    # 4. ジャンル検索
+                    # 4. ジャンル検索 (ID取得用)
                     http_client.get(
                         f"{JELLYFIN_URL}/Genres",
                         params={"searchTerm": search_term, "limit": 20},
+                        headers=headers
+                    ),
+                    # 4-2. ジャンル名直接検索 (手動追加ジャンル用)
+                    http_client.get(
+                        f"{JELLYFIN_URL}/Items",
+                        params={**base_params, "genres": search_term, "limit": 2000},
                         headers=headers
                     ),
                     # 5. スタジオ検索
@@ -628,11 +651,15 @@ async def search_items(
                     get_all_tags(),
                 ]
 
-                r1, r_series, r_person, r_genre, r_studio, all_tags = await asyncio.gather(*tasks, return_exceptions=True)
+                r1, r_series, r_person, r_genre, r_genre_direct, r_studio, all_tags = await asyncio.gather(*tasks, return_exceptions=True)
 
                 items_map: Dict[str, Any] = {}
                 if not isinstance(r1, Exception) and r1.status_code == 200:
                     for it in r1.json().get("Items", []):
+                        items_map[it.get("Id")] = it
+
+                if not isinstance(r_genre_direct, Exception) and r_genre_direct.status_code == 200:
+                    for it in r_genre_direct.json().get("Items", []):
                         items_map[it.get("Id")] = it
 
                 series_ids: List[str] = []

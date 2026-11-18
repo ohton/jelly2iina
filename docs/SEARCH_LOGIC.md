@@ -132,7 +132,7 @@ flowchart TD
 | 1 | **直接アイテム** | `GET /Items` | `searchTerm={q}`, `includeItemTypes=Movie,Episode,Video`, `limit=2000` | タイトル名（Name）にキーワードが含まれる動画を直接取得 |
 | 2 | **シリーズ** | `GET /Items` | `searchTerm={q}`, `includeItemTypes=Series`, `limit=50` | キーワードに一致する番組・アニメ・ドラマのシリーズ本体を検索 |
 | 3 | **出演者** | `GET /Persons` | `searchTerm={q}`, `limit=30` | キャスト・声優・監督等の人物情報を検索し Person ID を取得 |
-| 4 | **ジャンル** | `GET /Genres` | `searchTerm={q}`, `limit=20` | ジャンル情報を検索し Genre ID を取得 |
+| 4 | **ジャンル** | `GET /Genres` & `GET /Items?genres={q}` | `searchTerm={q}`, `limit=20` / `genres={q}` | ジャンルID検索に加え、手動追加・カスタムジャンル用のジャンル名直接検索 |
 | 5 | **スタジオ** | `GET /Studios` | `searchTerm={q}`, `limit=30` | アニメ制作会社・映画配給会社等を検索し Studio ID を取得 |
 | 6 | **タグ** | キャッシュ突き合わせ | （内部キャッシュ `/Items/Filters2`） | 全タグ一覧から部分一致するタグ名を抽出 |
 
