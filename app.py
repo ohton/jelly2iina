@@ -1282,6 +1282,92 @@ async def add_to_jelly2iina_playlist(item_id: str):
         logger.error(f"[PLAYLIST_ERROR] item_id={item_id} | error={e}")
         raise HTTPException(status_code=500, detail=f"Playlist operation failed: {str(e)}")
 
+
+@app.delete("/api/playlist/jelly2iina")
+@app.post("/api/playlist/jelly2iina/clear")
+async def clear_jelly2iina_playlist():
+    if not JELLYFIN_API_KEY:
+        raise HTTPException(status_code=500, detail="JELLYFIN_API_KEY is not configured.")
+
+    user_id = await get_current_user_id()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Could not determine Jellyfin User ID.")
+
+    headers = get_auth_headers()
+
+    try:
+        # 1. 既存のプレイリスト一覧を取得して "jelly2iina" を検索
+        res = await http_client.get(
+            f"{JELLYFIN_URL}/Users/{user_id}/Items",
+            params={"includeItemTypes": "Playlist", "recursive": "true"},
+            headers=headers,
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch playlists: {res.text}")
+
+        playlists = res.json().get("Items", [])
+        target_playlist = next((p for p in playlists if p.get("Name") == PLAYLIST_NAME), None)
+
+        if not target_playlist:
+            return {
+                "status": "not_found",
+                "message": f"プレイリスト '{PLAYLIST_NAME}' は存在しません",
+            }
+
+        playlist_id = target_playlist.get("Id")
+
+        # 2. プレイリスト内の全アイテムを取得
+        items_res = await http_client.get(
+            f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+            params={"userId": user_id, "fields": "BasicSyncInfo"},
+            headers=headers,
+        )
+        if items_res.status_code != 200:
+            raise HTTPException(
+                status_code=items_res.status_code,
+                detail=f"Failed to fetch playlist items: {items_res.text}",
+            )
+
+        items_data = items_res.json().get("Items", [])
+        entry_ids = [it.get("PlaylistItemId") or it.get("Id") for it in items_data if (it.get("PlaylistItemId") or it.get("Id"))]
+
+        if not entry_ids:
+            return {
+                "status": "already_empty",
+                "playlist_id": playlist_id,
+                "message": f"プレイリスト '{PLAYLIST_NAME}' は既に空です",
+            }
+
+        # 3. プレイリストから全アイテムを削除 (DELETE /Playlists/{playlist_id}/Items)
+        # ※URL長制限を考慮し100件ずつチャンク処理
+        chunk_size = 100
+        for i in range(0, len(entry_ids), chunk_size):
+            chunk = entry_ids[i:i + chunk_size]
+            del_res = await http_client.delete(
+                f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+                params={"entryIds": ",".join(chunk)},
+                headers=headers,
+            )
+            if del_res.status_code not in (200, 204):
+                raise HTTPException(
+                    status_code=del_res.status_code,
+                    detail=f"Failed to remove items from playlist: {del_res.text}",
+                )
+
+        logger.info(f"[PLAYLIST_CLEARED] Cleared {len(entry_ids)} items from '{PLAYLIST_NAME}' ({playlist_id})")
+        return {
+            "status": "cleared",
+            "playlist_id": playlist_id,
+            "count": len(entry_ids),
+            "message": f"プレイリスト '{PLAYLIST_NAME}' の中身（{len(entry_ids)}件）をクリアしました",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[PLAYLIST_CLEAR_ERROR] error={e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear playlist items: {str(e)}")
+
 SVG_PLACEHOLDER = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400" fill="#1e222d">
   <rect width="400" height="400" fill="#181b24"/>
   <circle cx="200" cy="180" r="40" fill="#2b3142"/>
@@ -1527,6 +1613,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     .refresh-btn:active {
       transform: scale(0.92);
+    }
+
+    .playlist-clear-btn:hover {
+      border-color: #ef4444;
+      background-color: rgba(239, 68, 68, 0.14);
+      color: #ef4444;
+      box-shadow: 0 0 10px rgba(239, 68, 68, 0.3);
     }
 
     .refresh-icon {
@@ -2342,6 +2435,15 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             <path d="M16 16h5v5"/>
           </svg>
         </button>
+
+        <button type="button" id="clearPlaylistBtn" class="refresh-btn playlist-clear-btn" title="プレイリスト (jelly2iina) の中身をクリア">
+          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            <line x1="10" y1="11" x2="10" y2="17"/>
+            <line x1="14" y1="11" x2="14" y2="17"/>
+          </svg>
+        </button>
       </div>
 
       <a href="#" target="_blank" rel="noopener noreferrer" class="server-status" id="serverStatus" title="Jellyfinホームを開く (新しいタブ)">
@@ -2512,6 +2614,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const playerSelect = document.getElementById('playerSelect');
     const sortSelect = document.getElementById('sortSelect');
     const refreshBtn = document.getElementById('refreshBtn');
+    const clearPlaylistBtn = document.getElementById('clearPlaylistBtn');
     const videoGrid = document.getElementById('videoGrid');
     const resultCount = document.getElementById('resultCount');
     const brandBtn = document.getElementById('brandBtn');
@@ -3296,6 +3399,34 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     refreshBtn.addEventListener('click', refreshView);
+
+    async function handleClearPlaylist() {
+      if (!confirm("プレイリスト「jelly2iina」の中身をすべてクリアしますか？")) {
+        return;
+      }
+      clearPlaylistBtn.disabled = true;
+      clearPlaylistBtn.style.opacity = '0.5';
+      try {
+        const res = await fetch('/api/playlist/jelly2iina', { method: 'DELETE' });
+        const data = await res.json();
+        if (res.ok) {
+          if (data.status === 'not_found' || data.status === 'already_empty') {
+            showToast(`ℹ️ ${data.message}`);
+          } else {
+            showToast(`🗑️ ${data.message || 'プレイリストをクリアしました'}`);
+          }
+        } else {
+          showToast(`❌ エラー: ${data.detail || 'クリアに失敗しました'}`);
+        }
+      } catch (err) {
+        showToast('❌ 通信エラーが発生しました');
+      } finally {
+        clearPlaylistBtn.disabled = false;
+        clearPlaylistBtn.style.opacity = '1';
+      }
+    }
+
+    clearPlaylistBtn.addEventListener('click', handleClearPlaylist);
 
     searchInput.addEventListener('input', (e) => {
       const val = e.target.value;
