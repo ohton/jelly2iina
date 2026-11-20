@@ -132,6 +132,87 @@ def build_iina_url(path: str) -> str:
 def build_mpv_url(item_id: str) -> str:
     return build_mpv_stream_url(build_stream_url(item_id))
 
+def format_item_for_client(it: dict, server_os: str = "linux") -> dict:
+    path = it.get("Path", "")
+    if not path:
+        media_sources = it.get("MediaSources", [])
+        if media_sources and "Path" in media_sources[0]:
+            path = media_sources[0]["Path"]
+
+    item_id = it.get("Id", "")
+    name = it.get("Name", "Unknown")
+    series_name = it.get("SeriesName", "")
+    series_id = it.get("SeriesId", "")
+    runtime_ticks = it.get("RunTimeTicks")
+    has_primary_image = bool(it.get("ImageTags", {}).get("Primary"))
+    rating = it.get("CommunityRating")
+    user_data = it.get("UserData") or {}
+    user_rating = user_data.get("Rating")
+    tags = it.get("Tags", []) or []
+    studios = [s.get("Name") for s in it.get("Studios", []) if isinstance(s, dict) and s.get("Name")]
+
+    people = it.get("People", []) or []
+    actors = []
+    seen_actor_names = set()
+    for p in people:
+        p_type = p.get("Type", "")
+        p_role = p.get("Role", "")
+        if p_type == "Actor" or (p_role and p_role.lower() == "actor"):
+            p_name = p.get("Name")
+            if p_name and p_name not in seen_actor_names:
+                seen_actor_names.add(p_name)
+                actors.append({
+                    "name": p_name,
+                    "role": p_role if (p_role and p_role.lower() != "actor") else ""
+                })
+
+    parent_idx = it.get("ParentIndexNumber")
+    idx = it.get("IndexNumber")
+    episode_badge = ""
+    if parent_idx is not None and idx is not None:
+        episode_badge = f"S{parent_idx}:E{idx}"
+    elif idx is not None:
+        episode_badge = f"E{idx}"
+
+    srv_os = "windows" if (path and is_windows_path(path)) else server_os
+
+    stream_url = build_stream_url(item_id) if path or it.get("Type") in ("Episode", "Movie", "Video") else ""
+    iina_file = build_iina_file_url(path) if path else ""
+    iina_stream = build_iina_stream_url(stream_url) if stream_url else ""
+    mpv_file = build_mpv_file_url(path) if path else ""
+    mpv_stream = build_mpv_stream_url(stream_url) if stream_url else ""
+
+    return {
+        "id": item_id,
+        "name": name,
+        "series_name": series_name,
+        "series_id": series_id,
+        "episode_badge": episode_badge,
+        "type": it.get("Type", "Video"),
+        "path": path,
+        "server_os": srv_os,
+        "stream_url": stream_url,
+        "jellyfin_url": f"{JELLYFIN_URL}/web/index.html#!/details?id={item_id}",
+        "iina_file_url": iina_file,
+        "iina_stream_url": iina_stream,
+        "mpv_file_url": mpv_file,
+        "mpv_stream_url": mpv_stream,
+        "iina_url": iina_file,
+        "mpv_url": mpv_stream,
+        "has_image": has_primary_image,
+        "runtime": format_runtime(runtime_ticks) if runtime_ticks else "",
+        "rating": round(rating, 1) if rating is not None else None,
+        "user_rating": round(user_rating, 1) if user_rating is not None else None,
+        "premiere_date": str(it.get("PremiereDate", ""))[:10] if it.get("PremiereDate") else "",
+        "tags": tags[:12],
+        "genres": it.get("Genres", []) or [],
+        "actors": actors,
+        "studios": studios[:2],
+        "year": it.get("ProductionYear"),
+        "original_title": it.get("OriginalTitle") or "",
+        "overview": it.get("Overview", ""),
+    }
+
 # サーバーOS自動判定管理 ("linux" または "windows")
 detected_server_os: str = "linux"
 last_server_os_fetch: float = 0.0
@@ -847,85 +928,7 @@ async def search_items(
             items = data.get("Items", [])
             total_record_count = data.get("TotalRecordCount", len(items))
 
-        results = []
-        for it in items:
-            path = it.get("Path", "")
-            if not path:
-                media_sources = it.get("MediaSources", [])
-                if media_sources and "Path" in media_sources[0]:
-                    path = media_sources[0]["Path"]
-
-            item_id = it.get("Id", "")
-            name = it.get("Name", "Unknown")
-            series_name = it.get("SeriesName", "")
-            runtime_ticks = it.get("RunTimeTicks")
-            has_primary_image = bool(it.get("ImageTags", {}).get("Primary"))
-            rating = it.get("CommunityRating")
-            user_data = it.get("UserData") or {}
-            user_rating = user_data.get("Rating")
-            tags = it.get("Tags", []) or []
-            studios = [s.get("Name") for s in it.get("Studios", []) if s.get("Name")]
-
-            people = it.get("People", []) or []
-            actors = []
-            seen_actor_names = set()
-            for p in people:
-                p_type = p.get("Type", "")
-                p_role = p.get("Role", "")
-                if p_type == "Actor" or (p_role and p_role.lower() == "actor"):
-                    p_name = p.get("Name")
-                    if p_name and p_name not in seen_actor_names:
-                        seen_actor_names.add(p_name)
-                        actors.append({
-                            "name": p_name,
-                            "role": p_role if (p_role and p_role.lower() != "actor") else ""
-                        })
-
-            parent_idx = it.get("ParentIndexNumber")
-            idx = it.get("IndexNumber")
-            episode_badge = ""
-            if parent_idx is not None and idx is not None:
-                episode_badge = f"S{parent_idx}:E{idx}"
-            elif idx is not None:
-                episode_badge = f"E{idx}"
-
-            srv_os = "windows" if is_windows_path(path) else server_os
-
-            stream_url = build_stream_url(item_id)
-            iina_file = build_iina_file_url(path)
-            iina_stream = build_iina_stream_url(stream_url)
-            mpv_file = build_mpv_file_url(path)
-            mpv_stream = build_mpv_stream_url(stream_url)
-
-            results.append({
-                "id": item_id,
-                "name": name,
-                "series_name": series_name,
-                "episode_badge": episode_badge,
-                "type": it.get("Type", "Video"),
-                "path": path,
-                "server_os": srv_os,
-                "stream_url": stream_url,
-                "jellyfin_url": f"{JELLYFIN_URL}/web/index.html#!/details?id={item_id}",
-                "iina_file_url": iina_file,
-                "iina_stream_url": iina_stream,
-                "mpv_file_url": mpv_file,
-                "mpv_stream_url": mpv_stream,
-                "iina_url": iina_file,
-                "mpv_url": mpv_stream,
-                "has_image": has_primary_image,
-                "runtime": format_runtime(runtime_ticks),
-                "rating": round(rating, 1) if rating is not None else None,
-                "user_rating": round(user_rating, 1) if user_rating is not None else None,
-                "premiere_date": it.get("PremiereDate", "")[:10] if it.get("PremiereDate") else "",
-                "tags": tags[:12],
-                "genres": it.get("Genres", []) or [],
-                "actors": actors,
-                "studios": studios[:2],
-                "year": it.get("ProductionYear"),
-                "original_title": it.get("OriginalTitle") or "",
-                "overview": it.get("Overview", ""),
-            })
+        results = [format_item_for_client(it, server_os) for it in items]
 
         return {
             "total": total_record_count,
@@ -950,18 +953,119 @@ class MetadataUpdateRequest(BaseModel):
     premiere_date: Optional[str] = None
     clear_premiere_date: Optional[bool] = False
 
-# 全てのItemFieldsを列挙して取得時に未編集フィールド（原題OriginalTitle, ProviderIds, SortName等）がPOST更新で消去されるのを防止
+# 全てのItemFieldsを列挙して取得時に未編集フィールド（原題OriginalTitle, ProviderIds, SortName, シリーズ固有情報等）がPOST更新で消去されるのを防止
 # (※ Trickplay はJellyfinのPOST更新時に内部型エラーを引き起こすため除外)
 ALL_UPDATE_FIELDS = (
-    "AirTime,CanDelete,CanDownload,ChannelInfo,Chapters,ChildCount,"
-    "CumulativeRunTimeTicks,CustomRating,DateCreated,DateLastMediaAdded,DisplayPreferencesId,"
-    "Etag,ExternalUrls,Genres,ItemCounts,MediaSourceCount,MediaSources,OriginalTitle,Overview,"
-    "ParentId,Path,People,PlayAccess,ProductionLocations,ProviderIds,PrimaryImageAspectRatio,"
-    "RecursiveItemCount,Settings,SeriesStudio,SortName,SpecialEpisodeNumbers,Studios,Taglines,Tags,"
-    "RemoteTrailers,MediaStreams,SeasonUserData,DateLastRefreshed,DateLastSaved,RefreshState,"
-    "ChannelImage,EnableMediaSourceDisplay,Width,Height,ExtraIds,LocalTrailerCount,IsHD,SpecialFeatureCount,"
-    "CommunityRating,PremiereDate,ProductionYear"
+    "AirDays,AirTime,CanDelete,CanDownload,ChannelImage,ChannelInfo,Chapters,ChildCount,"
+    "CommunityRating,CumulativeRunTimeTicks,CustomRating,DateCreated,DateLastMediaAdded,"
+    "DateLastRefreshed,DateLastSaved,DisplayOrder,DisplayPreferencesId,EnableMediaSourceDisplay,"
+    "EndDate,Etag,ExternalUrls,ExtraIds,ForcedSortName,Genres,Height,IsHD,ItemCounts,"
+    "LocalTrailerCount,LockData,LockedFields,MediaSourceCount,MediaSources,MediaStreams,"
+    "OfficialRating,OriginalTitle,Overview,ParentId,Path,People,PlayAccess,PremiereDate,"
+    "PrimaryImageAspectRatio,ProductionLocations,ProductionYear,ProviderIds,RecursiveItemCount,"
+    "RefreshState,RemoteTrailers,SeasonUserData,SeriesStudio,Settings,SortName,"
+    "SpecialEpisodeNumbers,SpecialFeatureCount,Status,Studios,Taglines,Tags,Width"
 )
+
+@app.get("/api/items/{item_id}")
+async def get_item_detail(item_id: str):
+    if not JELLYFIN_API_KEY:
+        raise HTTPException(status_code=401, detail="API Key not configured")
+
+    headers = get_auth_headers()
+    user_id = await get_current_user_id()
+    server_os = await detect_server_os()
+
+    try:
+        url = f"{JELLYFIN_URL}/Users/{user_id}/Items/{item_id}" if user_id else f"{JELLYFIN_URL}/Items/{item_id}"
+        res = await http_client.get(url, params={"fields": ALL_UPDATE_FIELDS}, headers=headers)
+        if res.status_code == 200:
+            item_data = res.json()
+        else:
+            # フォールバック: /Items?ids=...
+            res2 = await http_client.get(
+                f"{JELLYFIN_URL}/Items",
+                params={"ids": item_id, "fields": ALL_UPDATE_FIELDS},
+                headers=headers
+            )
+            if res2.status_code != 200:
+                raise HTTPException(status_code=res2.status_code, detail="Failed to fetch item from Jellyfin")
+            items = res2.json().get("Items", [])
+            if not items:
+                raise HTTPException(status_code=404, detail="Item not found")
+            item_data = items[0]
+
+        return format_item_for_client(item_data, server_os)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[ITEM_DETAIL_ERROR] item_id={item_id} error={e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sessions/now-playing")
+async def get_now_playing_sessions():
+    if not JELLYFIN_API_KEY:
+        return {"sessions": []}
+
+    headers = get_auth_headers()
+    try:
+        res = await http_client.get(f"{JELLYFIN_URL}/Sessions", headers=headers)
+        if res.status_code != 200:
+            return {"sessions": []}
+
+        sessions = res.json()
+        now_playing_list = []
+
+        for s in sessions:
+            np = s.get("NowPlayingItem")
+            if not np:
+                continue
+
+            play_state = s.get("PlayState") or {}
+            pos_ticks = play_state.get("PositionTicks")
+            run_ticks = np.get("RunTimeTicks")
+
+            pos_str = format_runtime(pos_ticks) if pos_ticks else "00:00"
+            run_str = format_runtime(run_ticks) if run_ticks else "--:--"
+            progress = 0.0
+            if pos_ticks and run_ticks and run_ticks > 0:
+                progress = round((pos_ticks / run_ticks) * 100.0, 1)
+
+            item_id = np.get("Id", "")
+            item_type = np.get("Type", "Video")
+            series_id = np.get("SeriesId", "")
+            series_name = np.get("SeriesName", "")
+
+            client_name = s.get("Client", "Player")
+            device_name = s.get("DeviceName", "Unknown")
+
+            now_playing_list.append({
+                "session_id": s.get("Id", ""),
+                "device_name": device_name,
+                "client": client_name,
+                "user_name": s.get("UserName", ""),
+                "is_paused": play_state.get("IsPaused", False),
+                "position_ticks": pos_ticks,
+                "runtime_ticks": run_ticks,
+                "position_str": pos_str,
+                "runtime_str": run_str,
+                "progress_percent": progress,
+                "item_id": item_id,
+                "item_name": np.get("Name", "Unknown"),
+                "item_type": item_type,
+                "series_id": series_id,
+                "series_name": series_name,
+                "season_name": np.get("SeasonName", ""),
+                "index_number": np.get("IndexNumber"),
+                "parent_index_number": np.get("ParentIndexNumber"),
+                "thumb_url": f"/api/image/{item_id}",
+                "jellyfin_url": f"{JELLYFIN_URL}/web/index.html#!/details?id={item_id}"
+            })
+
+        return {"sessions": now_playing_list}
+    except Exception as e:
+        logger.error(f"[NOW_PLAYING_ERROR] error={e}")
+        return {"sessions": []}
 
 @app.post("/api/items/{item_id}/metadata")
 async def update_item_metadata(item_id: str, payload: MetadataUpdateRequest):
@@ -1282,6 +1386,92 @@ async def add_to_jelly2iina_playlist(item_id: str):
         logger.error(f"[PLAYLIST_ERROR] item_id={item_id} | error={e}")
         raise HTTPException(status_code=500, detail=f"Playlist operation failed: {str(e)}")
 
+
+@app.delete("/api/playlist/jelly2iina")
+@app.post("/api/playlist/jelly2iina/clear")
+async def clear_jelly2iina_playlist():
+    if not JELLYFIN_API_KEY:
+        raise HTTPException(status_code=500, detail="JELLYFIN_API_KEY is not configured.")
+
+    user_id = await get_current_user_id()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Could not determine Jellyfin User ID.")
+
+    headers = get_auth_headers()
+
+    try:
+        # 1. 既存のプレイリスト一覧を取得して "jelly2iina" を検索
+        res = await http_client.get(
+            f"{JELLYFIN_URL}/Users/{user_id}/Items",
+            params={"includeItemTypes": "Playlist", "recursive": "true"},
+            headers=headers,
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch playlists: {res.text}")
+
+        playlists = res.json().get("Items", [])
+        target_playlist = next((p for p in playlists if p.get("Name") == PLAYLIST_NAME), None)
+
+        if not target_playlist:
+            return {
+                "status": "not_found",
+                "message": f"プレイリスト '{PLAYLIST_NAME}' は存在しません",
+            }
+
+        playlist_id = target_playlist.get("Id")
+
+        # 2. プレイリスト内の全アイテムを取得
+        items_res = await http_client.get(
+            f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+            params={"userId": user_id, "fields": "BasicSyncInfo"},
+            headers=headers,
+        )
+        if items_res.status_code != 200:
+            raise HTTPException(
+                status_code=items_res.status_code,
+                detail=f"Failed to fetch playlist items: {items_res.text}",
+            )
+
+        items_data = items_res.json().get("Items", [])
+        entry_ids = [it.get("PlaylistItemId") or it.get("Id") for it in items_data if (it.get("PlaylistItemId") or it.get("Id"))]
+
+        if not entry_ids:
+            return {
+                "status": "already_empty",
+                "playlist_id": playlist_id,
+                "message": f"プレイリスト '{PLAYLIST_NAME}' は既に空です",
+            }
+
+        # 3. プレイリストから全アイテムを削除 (DELETE /Playlists/{playlist_id}/Items)
+        # ※URL長制限を考慮し100件ずつチャンク処理
+        chunk_size = 100
+        for i in range(0, len(entry_ids), chunk_size):
+            chunk = entry_ids[i:i + chunk_size]
+            del_res = await http_client.delete(
+                f"{JELLYFIN_URL}/Playlists/{playlist_id}/Items",
+                params={"entryIds": ",".join(chunk)},
+                headers=headers,
+            )
+            if del_res.status_code not in (200, 204):
+                raise HTTPException(
+                    status_code=del_res.status_code,
+                    detail=f"Failed to remove items from playlist: {del_res.text}",
+                )
+
+        logger.info(f"[PLAYLIST_CLEARED] Cleared {len(entry_ids)} items from '{PLAYLIST_NAME}' ({playlist_id})")
+        return {
+            "status": "cleared",
+            "playlist_id": playlist_id,
+            "count": len(entry_ids),
+            "message": f"プレイリスト '{PLAYLIST_NAME}' の中身（{len(entry_ids)}件）をクリアしました",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[PLAYLIST_CLEAR_ERROR] error={e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear playlist items: {str(e)}")
+
 SVG_PLACEHOLDER = """<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400" fill="#1e222d">
   <rect width="400" height="400" fill="#181b24"/>
   <circle cx="200" cy="180" r="40" fill="#2b3142"/>
@@ -1529,6 +1719,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       transform: scale(0.92);
     }
 
+    .playlist-clear-btn:hover {
+      border-color: #ef4444;
+      background-color: rgba(239, 68, 68, 0.14);
+      color: #ef4444;
+      box-shadow: 0 0 10px rgba(239, 68, 68, 0.3);
+    }
+
     .refresh-icon {
       transition: transform var(--transition);
     }
@@ -1638,7 +1835,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
       gap: 1.5rem;
     }
 
@@ -1935,23 +2132,26 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     .card-actions {
       display: flex;
-      gap: 0.5rem;
+      gap: 0.35rem;
+      align-items: center;
     }
 
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 0.4rem;
-      padding: 0.6rem 1rem;
+      gap: 0.35rem;
+      padding: 0.55rem 0.75rem;
       border-radius: 8px;
-      font-size: 0.88rem;
+      font-size: 0.85rem;
       font-weight: 600;
       text-decoration: none;
       cursor: pointer;
       border: none;
       transition: var(--transition);
+      white-space: nowrap;
       flex: 1;
+      min-width: 0;
     }
 
     .btn-primary {
@@ -1986,8 +2186,15 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     .btn-secondary {
       background: #273043;
       color: var(--text-main);
-      flex: 0 0 auto;
-      padding: 0.6rem;
+      flex: 0 0 34px;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 7px;
+      font-size: 0.85rem;
     }
 
     .btn-secondary:hover {
@@ -2274,7 +2481,346 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       to { transform: rotate(360deg); }
     }
 
+    /* Now Playing Floating Bar (Case C) */
+    .now-playing-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 850;
+      background: rgba(14, 17, 23, 0.94);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-top: 1px solid rgba(99, 102, 241, 0.35);
+      box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
+      transform: translateY(110%);
+      transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .now-playing-bar.visible {
+      transform: translateY(0);
+    }
+
+    body.has-now-playing {
+      padding-bottom: 74px;
+    }
+
+    .now-playing-progress {
+      width: 100%;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.1);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .now-playing-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--primary), #ec4899);
+      width: 0%;
+      transition: width 0.5s ease;
+    }
+
+    .now-playing-container {
+      max-width: 1400px;
+      margin: 0 auto;
+      width: 100%;
+      padding: 0.55rem 1.2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.2rem;
+    }
+
+    .now-playing-left {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .now-playing-thumb {
+      width: 48px;
+      height: 48px;
+      border-radius: 8px;
+      object-fit: cover;
+      background: #1e222d;
+      flex-shrink: 0;
+      border: 1px solid var(--border-color);
+    }
+
+    .now-playing-meta {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      overflow: hidden;
+    }
+
+    .now-playing-device-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.72rem;
+    }
+
+    .now-playing-pulse {
+      width: 7px;
+      height: 7px;
+      background-color: var(--accent-green);
+      border-radius: 50%;
+      box-shadow: 0 0 6px var(--accent-green);
+      animation: pulse 1.8s infinite;
+      flex-shrink: 0;
+    }
+
+    .now-playing-device-badge {
+      font-weight: 600;
+      color: var(--accent-green);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .now-playing-session-select {
+      background: #161b26;
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      font-size: 0.72rem;
+      padding: 1px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .now-playing-title-wrap {
+      overflow: hidden;
+      white-space: nowrap;
+      position: relative;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .now-playing-title-wrap.is-overflow {
+      mask-image: linear-gradient(to right, black calc(100% - 24px), transparent 100%);
+      -webkit-mask-image: linear-gradient(to right, black calc(100% - 24px), transparent 100%);
+    }
+
+    .now-playing-title-track {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 8px;
+      white-space: nowrap;
+      will-change: transform;
+    }
+
+    .now-playing-title-track.marquee {
+      animation: marquee-scroll var(--marquee-duration, 8s) ease-in-out infinite alternate;
+    }
+
+    .now-playing-title-track.marquee:hover {
+      animation-play-state: paused;
+    }
+
+    @keyframes marquee-scroll {
+      0%, 18% {
+        transform: translateX(0);
+      }
+      82%, 100% {
+        transform: translateX(calc(-1 * var(--marquee-distance, 0px)));
+      }
+    }
+
+    .now-playing-title {
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text-main);
+      white-space: nowrap;
+    }
+
+    .now-playing-series {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .now-playing-time {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.72rem;
+      color: var(--text-sub);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .now-playing-status-badge {
+      background: rgba(255, 255, 255, 0.08);
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: var(--text-muted);
+    }
+
+    .now-playing-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      flex-shrink: 0;
+    }
+
+    .now-playing-btn {
+      padding: 0.42rem 0.85rem;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--border-color);
+      background: #161b26;
+      color: var(--text-main);
+      transition: var(--transition);
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .now-playing-btn:hover {
+      background: var(--primary-light);
+      border-color: var(--primary);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+
+    .now-playing-btn.primary {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+    }
+
+    .now-playing-btn.primary:hover {
+      background: var(--primary-hover);
+      box-shadow: 0 0 12px rgba(99, 102, 241, 0.4);
+    }
+
+    .now-playing-btn.series-btn {
+      background: rgba(168, 85, 247, 0.16);
+      border-color: rgba(168, 85, 247, 0.4);
+      color: #c084fc;
+    }
+
+    .now-playing-btn.series-btn:hover {
+      background: rgba(168, 85, 247, 0.28);
+      border-color: #a855f7;
+      color: #fff;
+      box-shadow: 0 0 12px rgba(168, 85, 247, 0.35);
+    }
+
+    .now-playing-close {
+      background: transparent;
+      border: none;
+      color: var(--text-sub);
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: var(--transition);
+      font-size: 0.85rem;
+    }
+
+    .now-playing-close:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    /* 最小化時の再表示ピルボタン (画面右下) */
+    .now-playing-pill {
+      position: fixed;
+      bottom: 1.2rem;
+      right: 1.2rem;
+      z-index: 840;
+      background: rgba(22, 27, 38, 0.95);
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55);
+      padding: 0.5rem 0.95rem;
+      border-radius: 9999px;
+      color: var(--text-main);
+      font-size: 0.82rem;
+      font-weight: 500;
+      display: none;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      transition: var(--transition);
+      max-width: 280px;
+    }
+
+    .now-playing-pill.visible {
+      display: inline-flex;
+      animation: pillFadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .now-playing-pill:hover {
+      background: #1f2637;
+      border-color: var(--primary);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(99, 102, 241, 0.35);
+      color: #fff;
+    }
+
+    .now-playing-pill-text {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    @keyframes pillFadeIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ヘッダーの再生中バッジボタン */
+    .header-now-playing-btn {
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: var(--accent-green);
+      padding: 0.4rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: var(--transition);
+      white-space: nowrap;
+    }
+
+    .header-now-playing-btn:hover {
+      background: rgba(16, 185, 129, 0.22);
+      border-color: var(--accent-green);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+
     @media (max-width: 768px) {
+      .now-playing-container {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.5rem;
+        padding: 0.5rem 0.8rem;
+      }
+      .now-playing-actions {
+        justify-content: flex-end;
+      }
+      body.has-now-playing {
+        padding-bottom: 110px;
+      }
       .header-content {
         flex-direction: column;
         align-items: stretch;
@@ -2342,6 +2888,21 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             <path d="M16 16h5v5"/>
           </svg>
         </button>
+
+        <button type="button" id="clearPlaylistBtn" class="refresh-btn playlist-clear-btn" title="プレイリスト (jelly2iina) の中身をクリア">
+          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            <line x1="10" y1="11" x2="10" y2="17"/>
+            <line x1="14" y1="11" x2="14" y2="17"/>
+          </svg>
+        </button>
+
+        <!-- 再生中クイックインジケーター / 再表示ボタン -->
+        <button type="button" id="headerNowPlayingBtn" class="header-now-playing-btn" style="display:none;" title="再生中の作品を表示・編集">
+          <span class="now-playing-pulse"></span>
+          <span>📺 再生中</span>
+        </button>
       </div>
 
       <a href="#" target="_blank" rel="noopener noreferrer" class="server-status" id="serverStatus" title="Jellyfinホームを開く (新しいタブ)">
@@ -2375,11 +2936,58 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     </div>
   </main>
 
+  <!-- 再生中フローティングバー (Now Playing Bar) -->
+  <div id="nowPlayingBar" class="now-playing-bar" aria-live="polite">
+    <div class="now-playing-progress">
+      <div id="nowPlayingProgressFill" class="now-playing-progress-fill"></div>
+    </div>
+    <div class="now-playing-container">
+      <div class="now-playing-left">
+        <img id="nowPlayingThumb" class="now-playing-thumb" src="" alt="Thumbnail" />
+        <div class="now-playing-meta">
+          <div class="now-playing-device-row">
+            <span class="now-playing-pulse"></span>
+            <span id="nowPlayingDeviceName" class="now-playing-device-badge">Apple TV · Infuse</span>
+            <select id="nowPlayingSessionSelect" class="now-playing-session-select" style="display:none;" title="再生中のデバイス切替"></select>
+          </div>
+          <div class="now-playing-title-wrap" id="nowPlayingTitleWrap">
+            <div class="now-playing-title-track" id="nowPlayingTitleTrack">
+              <span id="nowPlayingTitle" class="now-playing-title" title="">-</span>
+              <span id="nowPlayingSeries" class="now-playing-series" title=""></span>
+            </div>
+          </div>
+          <div class="now-playing-time">
+            <span id="nowPlayingTimeText">00:00 / 00:00</span>
+            <span id="nowPlayingStatusBadge" class="now-playing-status-badge">再生中</span>
+          </div>
+        </div>
+      </div>
+      <div class="now-playing-actions">
+        <button type="button" id="nowPlayingEditBtn" class="now-playing-btn primary" title="再生中作品のメタデータを編集">
+          <span>✏️</span> <span id="nowPlayingEditBtnText">編集</span>
+        </button>
+        <button type="button" id="nowPlayingSeriesBtn" class="now-playing-btn series-btn" style="display:none;" title="親シリーズ全体のメタデータを編集">
+          <span>📁</span> <span>シリーズを編集</span>
+        </button>
+        <a id="nowPlayingJellyfinLink" class="now-playing-btn" href="#" target="_blank" rel="noopener noreferrer" title="Jellyfinで詳細を開く">
+          <span>🌐</span>
+        </a>
+        <button type="button" id="nowPlayingCloseBtn" class="now-playing-close" title="再生中バーを最小化">✕</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 最小化時の再表示ピルボタン (右下にフロート表示) -->
+  <button type="button" id="nowPlayingPill" class="now-playing-pill" title="再生中バーを再表示">
+    <span class="now-playing-pulse"></span>
+    <span id="nowPlayingPillText" class="now-playing-pill-text">📺 再生中</span>
+  </button>
+
   <!-- メタデータ編集モーダル -->
   <div id="editModal" class="modal-backdrop">
     <div class="modal-content">
       <div class="modal-header">
-        <div class="modal-title">✏️ メタデータ編集</div>
+        <div id="editModalTitle" class="modal-title">✏️ メタデータ編集</div>
         <button id="modalCloseBtn" class="modal-close-btn" title="閉じる">✕</button>
       </div>
 
@@ -2512,6 +3120,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const playerSelect = document.getElementById('playerSelect');
     const sortSelect = document.getElementById('sortSelect');
     const refreshBtn = document.getElementById('refreshBtn');
+    const clearPlaylistBtn = document.getElementById('clearPlaylistBtn');
     const videoGrid = document.getElementById('videoGrid');
     const resultCount = document.getElementById('resultCount');
     const brandBtn = document.getElementById('brandBtn');
@@ -2596,6 +3205,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     // モーダル要素
     const editModal = document.getElementById('editModal');
+    const editModalTitle = document.getElementById('editModalTitle');
     const modalCloseBtn = document.getElementById('modalCloseBtn');
     const modalCancelBtn = document.getElementById('modalCancelBtn');
     const modalSaveBtn = document.getElementById('modalSaveBtn');
@@ -2612,6 +3222,27 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const editOverviewInput = document.getElementById('editOverviewInput');
     const editPremiereDateInput = document.getElementById('editPremiereDateInput');
     const clearDateBtn = document.getElementById('clearDateBtn');
+
+    // 再生中フローティングバー要素
+    const nowPlayingBar = document.getElementById('nowPlayingBar');
+    const nowPlayingPill = document.getElementById('nowPlayingPill');
+    const nowPlayingPillText = document.getElementById('nowPlayingPillText');
+    const headerNowPlayingBtn = document.getElementById('headerNowPlayingBtn');
+    const nowPlayingProgressFill = document.getElementById('nowPlayingProgressFill');
+    const nowPlayingThumb = document.getElementById('nowPlayingThumb');
+    const nowPlayingDeviceName = document.getElementById('nowPlayingDeviceName');
+    const nowPlayingSessionSelect = document.getElementById('nowPlayingSessionSelect');
+    const nowPlayingTitleWrap = document.getElementById('nowPlayingTitleWrap');
+    const nowPlayingTitleTrack = document.getElementById('nowPlayingTitleTrack');
+    const nowPlayingTitle = document.getElementById('nowPlayingTitle');
+    const nowPlayingSeries = document.getElementById('nowPlayingSeries');
+    const nowPlayingTimeText = document.getElementById('nowPlayingTimeText');
+    const nowPlayingStatusBadge = document.getElementById('nowPlayingStatusBadge');
+    const nowPlayingEditBtn = document.getElementById('nowPlayingEditBtn');
+    const nowPlayingEditBtnText = document.getElementById('nowPlayingEditBtnText');
+    const nowPlayingSeriesBtn = document.getElementById('nowPlayingSeriesBtn');
+    const nowPlayingJellyfinLink = document.getElementById('nowPlayingJellyfinLink');
+    const nowPlayingCloseBtn = document.getElementById('nowPlayingCloseBtn');
 
     const PAGE_LIMIT = 40;
     let currentStartIndex = 0;
@@ -2885,7 +3516,23 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     // モーダル操作
-    function openEditModal(itemId) {
+    async function openItemModal(itemId, editType = '') {
+      if (!itemId) return;
+      try {
+        let item = itemsCache.get(itemId);
+        if (!item || !item.genres || !item.tags) {
+          const res = await fetch(`/api/items/${itemId}`);
+          if (!res.ok) throw new Error('アイテム情報の取得に失敗しました');
+          item = await res.json();
+          itemsCache.set(itemId, item);
+        }
+        openEditModal(itemId, editType);
+      } catch (err) {
+        showToast(`エラー: ${err.message}`);
+      }
+    }
+
+    function openEditModal(itemId, editType = '') {
       const item = itemsCache.get(itemId);
       if (!item) return;
 
@@ -2906,6 +3553,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       setUserRatingUi(item.user_rating);
       setRatingUi(item.rating);
+
+      // モーダルタイトルに対象種別（親シリーズ / エピソード / 通常）を明示
+      if (editModalTitle) {
+        if (editType === 'series' || item.type === 'Series') {
+          editModalTitle.textContent = '📁 メタデータ編集 [親シリーズ]';
+        } else if (editType === 'episode' || item.type === 'Episode') {
+          editModalTitle.textContent = '✏️ メタデータ編集 [エピソード]';
+        } else {
+          editModalTitle.textContent = '✏️ メタデータ編集';
+        }
+      }
 
       editModal.classList.add('open');
     }
@@ -3035,6 +3693,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             cardEl.outerHTML = newHtml;
           }
         }
+
+        // 再生中バーの情報も最新に同期
+        checkNowPlaying();
 
       } catch (err) {
         showToast(`エラー: ${err.message}`);
@@ -3297,6 +3958,34 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     refreshBtn.addEventListener('click', refreshView);
 
+    async function handleClearPlaylist() {
+      if (!confirm("プレイリスト「jelly2iina」の中身をすべてクリアしますか？")) {
+        return;
+      }
+      clearPlaylistBtn.disabled = true;
+      clearPlaylistBtn.style.opacity = '0.5';
+      try {
+        const res = await fetch('/api/playlist/jelly2iina', { method: 'DELETE' });
+        const data = await res.json();
+        if (res.ok) {
+          if (data.status === 'not_found' || data.status === 'already_empty') {
+            showToast(`ℹ️ ${data.message}`);
+          } else {
+            showToast(`🗑️ ${data.message || 'プレイリストをクリアしました'}`);
+          }
+        } else {
+          showToast(`❌ エラー: ${data.detail || 'クリアに失敗しました'}`);
+        }
+      } catch (err) {
+        showToast('❌ 通信エラーが発生しました');
+      } finally {
+        clearPlaylistBtn.disabled = false;
+        clearPlaylistBtn.style.opacity = '1';
+      }
+    }
+
+    clearPlaylistBtn.addEventListener('click', handleClearPlaylist);
+
     searchInput.addEventListener('input', (e) => {
       const val = e.target.value;
       clearBtn.style.display = val ? 'block' : 'none';
@@ -3334,6 +4023,218 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     // 初期実行
     checkHealth();
     resetAndReload();
+
+    // ===== 再生中フローティングバー (Now Playing) ロジック =====
+    let nowPlayingSessions = [];
+    let currentSessionIndex = 0;
+    let isNowPlayingDismissed = false;
+    let dismissedSessionKey = null;
+
+    async function checkNowPlaying() {
+      try {
+        const res = await fetch('/api/sessions/now-playing');
+        if (!res.ok) return;
+        const data = await res.json();
+        const sessions = data.sessions || [];
+        nowPlayingSessions = sessions;
+
+        if (sessions.length === 0) {
+          nowPlayingBar.classList.remove('visible');
+          if (nowPlayingPill) nowPlayingPill.classList.remove('visible');
+          if (headerNowPlayingBtn) headerNowPlayingBtn.style.display = 'none';
+          document.body.classList.remove('has-now-playing');
+          isNowPlayingDismissed = false;
+          dismissedSessionKey = null;
+          return;
+        }
+
+        if (currentSessionIndex >= sessions.length) {
+          currentSessionIndex = 0;
+        }
+
+        const session = sessions[currentSessionIndex];
+        const currentKey = `${session.session_id}_${session.item_id}`;
+
+        // 別の作品が再生されたら非表示フラグを自動解除
+        if (isNowPlayingDismissed && dismissedSessionKey !== currentKey) {
+          isNowPlayingDismissed = false;
+          dismissedSessionKey = null;
+        }
+
+        // ヘッダーの再生中バッジボタンを表示
+        if (headerNowPlayingBtn) {
+          headerNowPlayingBtn.style.display = 'inline-flex';
+        }
+
+        // 最小化（閉じた）状態の場合はバーを隠し、右下にピルを表示
+        if (isNowPlayingDismissed) {
+          nowPlayingBar.classList.remove('visible');
+          document.body.classList.remove('has-now-playing');
+          if (nowPlayingPill) {
+            const shortName = session.item_name || '再生中';
+            if (nowPlayingPillText) {
+              nowPlayingPillText.textContent = `📺 ${shortName}`;
+            }
+            nowPlayingPill.classList.add('visible');
+          }
+          return;
+        }
+
+        // 通常表示状態の場合はピルを隠す
+        if (nowPlayingPill) {
+          nowPlayingPill.classList.remove('visible');
+        }
+
+        // DOM 反映
+        nowPlayingThumb.src = session.thumb_url || '';
+        nowPlayingThumb.onerror = () => {
+          nowPlayingThumb.src = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48' fill='%231e222d'><rect width='48' height='48'/></svg>";
+        };
+
+        nowPlayingTitle.textContent = session.item_name || '名称未設定';
+        nowPlayingTitle.title = session.item_name || '';
+
+        if (session.series_name) {
+          nowPlayingSeries.textContent = `(${session.series_name})`;
+          nowPlayingSeries.title = session.series_name;
+          nowPlayingSeries.style.display = 'inline';
+        } else {
+          nowPlayingSeries.textContent = '';
+          nowPlayingSeries.style.display = 'none';
+        }
+
+        const clientLabel = session.client ? ` · ${session.client}` : '';
+        nowPlayingDeviceName.textContent = `${session.device_name || 'Device'}${clientLabel}`;
+
+        if (sessions.length > 1) {
+          nowPlayingSessionSelect.innerHTML = sessions.map((s, idx) => `
+            <option value="${idx}" ${idx === currentSessionIndex ? 'selected' : ''}>
+              ${escapeHtml(s.device_name)} (${escapeHtml(s.item_name)})
+            </option>
+          `).join('');
+          nowPlayingSessionSelect.style.display = 'inline-block';
+        } else {
+          nowPlayingSessionSelect.style.display = 'none';
+        }
+
+        nowPlayingTimeText.textContent = `${session.position_str} / ${session.runtime_str}`;
+        nowPlayingStatusBadge.textContent = session.is_paused ? '一時停止' : '再生中';
+        nowPlayingStatusBadge.style.color = session.is_paused ? '#fbbf24' : 'var(--accent-green)';
+        nowPlayingProgressFill.style.width = `${Math.min(100, Math.max(0, session.progress_percent))}%`;
+
+        // エピソード/親シリーズの編集ボタン設定
+        if (session.series_id) {
+          nowPlayingEditBtnText.textContent = 'エピソードを編集';
+          nowPlayingSeriesBtn.style.display = 'inline-flex';
+          nowPlayingSeriesBtn.onclick = () => openItemModal(session.series_id, 'series');
+        } else {
+          nowPlayingEditBtnText.textContent = '編集';
+          nowPlayingSeriesBtn.style.display = 'none';
+          nowPlayingSeriesBtn.onclick = null;
+        }
+
+        nowPlayingEditBtn.onclick = () => openItemModal(session.item_id, session.series_id ? 'episode' : '');
+        nowPlayingJellyfinLink.href = session.jellyfin_url || '#';
+
+        nowPlayingBar.classList.add('visible');
+        document.body.classList.add('has-now-playing');
+
+        // タイトル横スクロール (マーキー) の更新
+        const itemKey = `${session.item_id}_${session.item_name}`;
+        if (currentMarqueeKey !== itemKey) {
+          currentMarqueeKey = itemKey;
+          nowPlayingTitleTrack.classList.remove('marquee');
+          nowPlayingTitleWrap.classList.remove('is-overflow');
+        }
+        requestAnimationFrame(() => {
+          updateTitleMarquee();
+        });
+
+      } catch (e) {
+        // バックグラウンドポーリングのためサイレントにキャッチ
+      }
+    }
+
+    let currentMarqueeKey = '';
+
+    function updateTitleMarquee() {
+      if (!nowPlayingTitleWrap || !nowPlayingTitleTrack) return;
+
+      const wrapWidth = nowPlayingTitleWrap.clientWidth;
+      const trackWidth = nowPlayingTitleTrack.scrollWidth;
+      const overflowDistance = trackWidth - wrapWidth;
+
+      if (overflowDistance > 6) {
+        nowPlayingTitleWrap.classList.add('is-overflow');
+        // スクロール速度: 1秒あたり約26px、長文でもゆったり往復
+        const duration = Math.max(6, Math.round(overflowDistance / 26 + 3));
+        nowPlayingTitleTrack.style.setProperty('--marquee-distance', `${overflowDistance + 14}px`);
+        nowPlayingTitleTrack.style.setProperty('--marquee-duration', `${duration}s`);
+        nowPlayingTitleTrack.classList.add('marquee');
+      } else {
+        nowPlayingTitleWrap.classList.remove('is-overflow');
+        nowPlayingTitleTrack.classList.remove('marquee');
+        nowPlayingTitleTrack.style.removeProperty('--marquee-distance');
+        nowPlayingTitleTrack.style.removeProperty('--marquee-duration');
+      }
+    }
+
+    window.addEventListener('resize', () => {
+      if (nowPlayingBar.classList.contains('visible')) {
+        updateTitleMarquee();
+      }
+    });
+
+    if (nowPlayingSessionSelect) {
+      nowPlayingSessionSelect.addEventListener('change', (e) => {
+        currentSessionIndex = parseInt(e.target.value, 10) || 0;
+        isNowPlayingDismissed = false;
+        checkNowPlaying();
+      });
+    }
+
+    // 再生中バーの再展開 (復帰)
+    function restoreNowPlayingBar() {
+      isNowPlayingDismissed = false;
+      dismissedSessionKey = null;
+      if (nowPlayingPill) {
+        nowPlayingPill.classList.remove('visible');
+      }
+      checkNowPlaying();
+    }
+
+    if (nowPlayingPill) {
+      nowPlayingPill.addEventListener('click', restoreNowPlayingBar);
+    }
+
+    if (headerNowPlayingBtn) {
+      headerNowPlayingBtn.addEventListener('click', restoreNowPlayingBar);
+    }
+
+    if (nowPlayingCloseBtn) {
+      nowPlayingCloseBtn.addEventListener('click', () => {
+        if (nowPlayingSessions.length > 0) {
+          const session = nowPlayingSessions[currentSessionIndex];
+          dismissedSessionKey = `${session.session_id}_${session.item_id}`;
+          isNowPlayingDismissed = true;
+          checkNowPlaying();
+        }
+      });
+    }
+
+    // 初回実行 & 5秒ポーリング & タブフォーカス連動
+    checkNowPlaying();
+    setInterval(() => {
+      if (!document.hidden) {
+        checkNowPlaying();
+      }
+    }, 5000);
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        checkNowPlaying();
+      }
+    });
   </script>
 </body>
 </html>
