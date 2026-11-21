@@ -2186,6 +2186,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     .btn-secondary {
       background: #273043;
       color: var(--text-main);
+      flex: 0 0 auto;
+      padding: 0.6rem 1.2rem;
+      border-radius: 8px;
+    }
+
+    .btn-secondary:hover {
+      background: #36425c;
+    }
+
+    /* カードアクション内の正方形アイコンボタン (➕, 📋, 🔗, 🌐) にのみ適用 */
+    .card-actions .btn-secondary {
       flex: 0 0 34px;
       width: 34px;
       height: 34px;
@@ -2195,10 +2206,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       justify-content: center;
       border-radius: 7px;
       font-size: 0.85rem;
-    }
-
-    .btn-secondary:hover {
-      background: #36425c;
     }
 
     .jf-detail-btn {
