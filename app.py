@@ -19,6 +19,10 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "http://localhost:8096").rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "").strip()
 
+# 内部検索取得上限 (デフォルト: 2000, 最大引き上げ安全上限: 10000)
+SEARCH_INTERNAL_FETCH_LIMIT = int(os.getenv("SEARCH_INTERNAL_FETCH_LIMIT", "2000"))
+SEARCH_MAX_FETCH_LIMIT = int(os.getenv("SEARCH_MAX_FETCH_LIMIT", "10000"))
+
 # ログ永続化設定 (/app/logs -> ホスト側 ./logs にマウント)
 LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -52,11 +56,15 @@ http_client: Optional[httpx.AsyncClient] = None
 cached_tags: List[str] = []
 last_tags_fetch: float = 0.0
 
+# ライブラリ（VirtualFolders）キャッシュ管理
+cached_libraries: List[Dict[str, Any]] = []
+last_libraries_fetch: float = 0.0
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     logger.info(f"jellyfin-iina-bridge starting... JELLYFIN_URL={JELLYFIN_URL}")
-    http_client = httpx.AsyncClient(timeout=15.0)
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0))
     yield
     logger.info("jellyfin-iina-bridge shutting down...")
     await http_client.aclose()
@@ -132,7 +140,18 @@ def build_iina_url(path: str) -> str:
 def build_mpv_url(item_id: str) -> str:
     return build_mpv_stream_url(build_stream_url(item_id))
 
-def format_item_for_client(it: dict, server_os: str = "linux") -> dict:
+def get_item_library_name(path: str, libraries: Optional[List[Dict[str, Any]]] = None) -> str:
+    if not path or not libraries:
+        return ""
+    norm_p = path.replace("/", "\\").lower()
+    for lib in libraries:
+        for loc in lib.get("Locations", []):
+            norm_loc = loc.replace("/", "\\").lower().rstrip("\\") + "\\"
+            if norm_p.startswith(norm_loc):
+                return lib.get("Name", "")
+    return ""
+
+def format_item_for_client(it: dict, server_os: str = "linux", libraries: Optional[List[Dict[str, Any]]] = None) -> dict:
     path = it.get("Path", "")
     if not path:
         media_sources = it.get("MediaSources", [])
@@ -150,6 +169,8 @@ def format_item_for_client(it: dict, server_os: str = "linux") -> dict:
     user_rating = user_data.get("Rating")
     tags = it.get("Tags", []) or []
     studios = [s.get("Name") for s in it.get("Studios", []) if isinstance(s, dict) and s.get("Name")]
+
+    library_name = get_item_library_name(path, libraries)
 
     people = it.get("People", []) or []
     actors = []
@@ -189,6 +210,7 @@ def format_item_for_client(it: dict, server_os: str = "linux") -> dict:
         "series_id": series_id,
         "episode_badge": episode_badge,
         "type": it.get("Type", "Video"),
+        "library_name": library_name,
         "path": path,
         "server_os": srv_os,
         "stream_url": stream_url,
@@ -299,6 +321,23 @@ async def get_all_tags() -> List[str]:
         pass
     return cached_tags
 
+async def get_virtual_folders() -> List[Dict[str, Any]]:
+    global cached_libraries, last_libraries_fetch
+    now = time.time()
+    if cached_libraries and (now - last_libraries_fetch < 600):
+        return cached_libraries
+    
+    headers = get_auth_headers()
+    try:
+        res = await http_client.get(f"{JELLYFIN_URL}/Library/VirtualFolders", headers=headers)
+        if res.status_code == 200:
+            cached_libraries = res.json()
+            last_libraries_fetch = now
+            return cached_libraries
+    except Exception:
+        pass
+    return cached_libraries
+
 @app.get("/health")
 async def health_check():
     srv_os = await detect_server_os()
@@ -358,23 +397,25 @@ SORT_CONFIG = {
     "random": ("Random", "Ascending"),
 }
 
-VALID_SEARCH_PREFIXES = {"item", "series", "actor", "genre", "studio", "tag"}
+VALID_SEARCH_PREFIXES = {"item", "series", "actor", "genre", "studio", "tag", "lib", "library"}
 
-def parse_search_query(q: str) -> Tuple[bool, List[Tuple[bool, str, str]]]:
+def parse_search_query(q: str) -> Tuple[bool, List[Tuple[bool, str, str]], int]:
     """
-    クエリ文字列をパースし、(is_explicit, filters) を返す。
+    クエリ文字列をパースし、(is_explicit, filters, fetch_limit) を返す。
     filters は [(is_not, prefix, term), ...] のリスト。
+    fetch_limit は 内部検索取得件数の上限（デフォルト: SEARCH_INTERNAL_FETCH_LIMIT）。
     """
     q_str = q.strip()
+    fetch_limit = SEARCH_INTERNAL_FETCH_LIMIT
     if not q_str:
-        return False, []
+        return False, [], fetch_limit
     try:
         tokens = shlex.split(q_str)
     except ValueError:
         tokens = q_str.split()
 
     if not tokens:
-        return False, []
+        return False, [], fetch_limit
 
     parsed: List[Tuple[bool, str, str]] = []
     has_explicit_filter = False
@@ -397,6 +438,16 @@ def parse_search_query(q: str) -> Tuple[bool, List[Tuple[bool, str, str]]]:
         if ":" in token:
             prefix, val = token.split(":", 1)
             p_lower = prefix.lower()
+            if p_lower in ("limit", "max") and val:
+                v_lower = val.lower()
+                if v_lower in ("all", "max", "unlimited", "0"):
+                    fetch_limit = SEARCH_MAX_FETCH_LIMIT
+                else:
+                    try:
+                        fetch_limit = min(max(1, int(val)), SEARCH_MAX_FETCH_LIMIT)
+                    except ValueError:
+                        pass
+                continue
             if p_lower in VALID_SEARCH_PREFIXES and val:
                 has_explicit_filter = True
                 parsed.append((is_not, p_lower, val))
@@ -404,14 +455,15 @@ def parse_search_query(q: str) -> Tuple[bool, List[Tuple[bool, str, str]]]:
         
         parsed.append((is_not, "item", token))
 
-    return has_explicit_filter, parsed
+    return has_explicit_filter, parsed, fetch_limit
 
 async def fetch_filter_items(
     prefix: str,
     val: str,
     base_params: Dict[str, Any],
     headers: Dict[str, str],
-    user_id: Optional[str]
+    user_id: Optional[str],
+    fetch_limit: int = SEARCH_INTERNAL_FETCH_LIMIT
 ) -> Dict[str, Any]:
     items_map: Dict[str, Any] = {}
     val_lower = val.lower()
@@ -420,15 +472,15 @@ async def fetch_filter_items(
         try:
             r = await http_client.get(
                 f"{JELLYFIN_URL}/Items",
-                params={**base_params, "searchTerm": val, "limit": 2000},
+                params={**base_params, "searchTerm": val, "limit": fetch_limit},
                 headers=headers
             )
             if r.status_code == 200:
                 for it in r.json().get("Items", []):
                     if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                         items_map[it["Id"]] = it
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'item' val '{val}': {e}")
 
     elif prefix == "series":
         try:
@@ -462,8 +514,8 @@ async def fetch_filter_items(
                         for it in res.json().get("Items", []):
                             if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                                 items_map[it["Id"]] = it
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'series' val '{val}': {e}")
 
     elif prefix == "actor":
         try:
@@ -481,15 +533,15 @@ async def fetch_filter_items(
             if person_ids:
                 r_items = await http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                    params={**base_params, "personIds": ",".join(person_ids), "limit": fetch_limit},
                     headers=headers
                 )
                 if r_items.status_code == 200:
                     for it in r_items.json().get("Items", []):
                         if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                             items_map[it["Id"]] = it
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'actor' val '{val}': {e}")
 
     elif prefix == "genre":
         try:
@@ -498,7 +550,7 @@ async def fetch_filter_items(
             tasks = [
                 http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "genres": val, "limit": 2000},
+                    params={**base_params, "genres": val, "limit": fetch_limit},
                     headers=headers,
                 ),
                 http_client.get(
@@ -524,15 +576,15 @@ async def fetch_filter_items(
             if genre_ids:
                 r_items_by_id = await http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                    params={**base_params, "genreIds": ",".join(genre_ids), "limit": fetch_limit},
                     headers=headers,
                 )
                 if r_items_by_id.status_code == 200:
                     for it in r_items_by_id.json().get("Items", []):
                         if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                             items_map[it["Id"]] = it
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'genre' val '{val}': {e}")
 
     elif prefix == "studio":
         try:
@@ -550,15 +602,15 @@ async def fetch_filter_items(
             if studio_ids:
                 r_items = await http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                    params={**base_params, "studioIds": ",".join(studio_ids), "limit": fetch_limit},
                     headers=headers
                 )
                 if r_items.status_code == 200:
                     for it in r_items.json().get("Items", []):
                         if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                             items_map[it["Id"]] = it
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'studio' val '{val}': {e}")
 
     elif prefix == "tag":
         try:
@@ -572,15 +624,40 @@ async def fetch_filter_items(
             if matched_tags:
                 r_items = await http_client.get(
                     f"{JELLYFIN_URL}/Items",
-                    params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                    params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": fetch_limit},
                     headers=headers
                 )
                 if r_items.status_code == 200:
                     for it in r_items.json().get("Items", []):
                         if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
                             items_map[it["Id"]] = it
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'tag' val '{val}': {e}")
+
+    elif prefix in ("lib", "library"):
+        try:
+            vfolders = await get_virtual_folders()
+            matched_libs = [vf for vf in vfolders if val_lower in vf.get("Name", "").lower()]
+            tasks = []
+            for vf in matched_libs:
+                lid = vf.get("ItemId")
+                if lid:
+                    tasks.append(
+                        http_client.get(
+                            f"{JELLYFIN_URL}/Items",
+                            params={**base_params, "parentId": lid, "limit": fetch_limit},
+                            headers=headers
+                        )
+                    )
+            if tasks:
+                res_list = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in res_list:
+                    if not isinstance(r, Exception) and r.status_code == 200:
+                        for it in r.json().get("Items", []):
+                            if it.get("Type") in ("Episode", "Movie", "Video") and it.get("Id"):
+                                items_map[it["Id"]] = it
+        except Exception as e:
+            logger.warning(f"Error fetching items for prefix 'lib' val '{val}': {e}")
 
     return items_map
 
@@ -588,7 +665,7 @@ async def fetch_filter_items(
 async def search_items(
     q: Optional[str] = Query(None, description="Search term"),
     sort: str = Query("premiere_desc", description="Sort option"),
-    limit: int = Query(40, ge=1, le=100),
+    limit: int = Query(40, ge=0, le=10000),
     startIndex: int = Query(0, ge=0)
 ):
     if not JELLYFIN_API_KEY:
@@ -601,13 +678,14 @@ async def search_items(
     headers = get_auth_headers()
     server_os = await detect_server_os()
     user_id = await get_current_user_id()
+    libraries = await get_virtual_folders()
 
-    base_fields = "Path,Overview,MediaSources,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData,OriginalTitle"
+    base_fields = "Path,PrimaryImageAspectRatio,DateCreated,PremiereDate,ProductionYear,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName,SeriesId,CommunityRating,Tags,Genres,Studios,People,UserData,OriginalTitle"
 
     try:
         if q and q.strip():
             search_term = q.strip()
-            is_explicit, parsed_filters = parse_search_query(search_term)
+            is_explicit, parsed_filters, fetch_limit = parse_search_query(search_term)
             base_params = {
                 "recursive": "true",
                 "includeItemTypes": "Movie,Episode,Video",
@@ -623,7 +701,7 @@ async def search_items(
 
                 # すべてのフィルタ取得タスクを並列生成
                 tasks = [
-                    fetch_filter_items(p, v, base_params, headers, user_id)
+                    fetch_filter_items(p, v, base_params, headers, user_id, fetch_limit)
                     for p, v in (positive_filters + negative_filters)
                 ]
 
@@ -695,7 +773,7 @@ async def search_items(
                     # 1. 通常のアイテム検索 (上限を大きく拡大)
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "searchTerm": search_term, "limit": 2000},
+                        params={**base_params, "searchTerm": search_term, "limit": fetch_limit},
                         headers=headers
                     ),
                     # 2. シリーズ (Series) 自体の検索
@@ -719,7 +797,7 @@ async def search_items(
                     # 4-2. ジャンル名直接検索 (手動追加ジャンル用)
                     http_client.get(
                         f"{JELLYFIN_URL}/Items",
-                        params={**base_params, "genres": search_term, "limit": 2000},
+                        params={**base_params, "genres": search_term, "limit": fetch_limit},
                         headers=headers
                     ),
                     # 5. スタジオ検索
@@ -792,7 +870,7 @@ async def search_items(
                     extra_tasks.append(
                         http_client.get(
                             f"{JELLYFIN_URL}/Items",
-                            params={**base_params, "personIds": ",".join(person_ids), "limit": 2000},
+                            params={**base_params, "personIds": ",".join(person_ids), "limit": fetch_limit},
                             headers=headers
                         )
                     )
@@ -800,7 +878,7 @@ async def search_items(
                     extra_tasks.append(
                         http_client.get(
                             f"{JELLYFIN_URL}/Items",
-                            params={**base_params, "genreIds": ",".join(genre_ids), "limit": 2000},
+                            params={**base_params, "genreIds": ",".join(genre_ids), "limit": fetch_limit},
                             headers=headers
                         )
                     )
@@ -808,7 +886,7 @@ async def search_items(
                     extra_tasks.append(
                         http_client.get(
                             f"{JELLYFIN_URL}/Items",
-                            params={**base_params, "studioIds": ",".join(studio_ids), "limit": 2000},
+                            params={**base_params, "studioIds": ",".join(studio_ids), "limit": fetch_limit},
                             headers=headers
                         )
                     )
@@ -816,7 +894,7 @@ async def search_items(
                     extra_tasks.append(
                         http_client.get(
                             f"{JELLYFIN_URL}/Items",
-                            params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": 2000},
+                            params={**base_params, "tags": "|".join(matched_tags[:15]), "limit": fetch_limit},
                             headers=headers
                         )
                     )
@@ -904,7 +982,10 @@ async def search_items(
                 rng.shuffle(all_items)
 
             total_record_count = len(all_items)
-            items = all_items[startIndex: startIndex + limit]
+            if limit == 0:
+                items = all_items[startIndex:]
+            else:
+                items = all_items[startIndex: startIndex + limit]
 
         else:
             params: Dict[str, Any] = {
@@ -928,13 +1009,18 @@ async def search_items(
             items = data.get("Items", [])
             total_record_count = data.get("TotalRecordCount", len(items))
 
-        results = [format_item_for_client(it, server_os) for it in items]
+        results = [format_item_for_client(it, server_os, libraries) for it in items]
+
+        current_fetch_limit = fetch_limit if (q and q.strip()) else SEARCH_INTERNAL_FETCH_LIMIT
+        hit_limit = bool(q and q.strip() and total_record_count >= current_fetch_limit)
 
         return {
             "total": total_record_count,
             "items": results,
             "startIndex": startIndex,
             "limit": limit,
+            "fetch_limit": current_fetch_limit,
+            "hit_limit": hit_limit,
         }
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Failed to connect to Jellyfin server: {str(e)}")
@@ -975,6 +1061,7 @@ async def get_item_detail(item_id: str):
     headers = get_auth_headers()
     user_id = await get_current_user_id()
     server_os = await detect_server_os()
+    libraries = await get_virtual_folders()
 
     try:
         url = f"{JELLYFIN_URL}/Users/{user_id}/Items/{item_id}" if user_id else f"{JELLYFIN_URL}/Items/{item_id}"
@@ -995,7 +1082,7 @@ async def get_item_detail(item_id: str):
                 raise HTTPException(status_code=404, detail="Item not found")
             item_data = items[0]
 
-        return format_item_for_client(item_data, server_os)
+        return format_item_for_client(item_data, server_os, libraries)
     except HTTPException:
         raise
     except Exception as e:
@@ -1824,6 +1911,197 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       color: #cbd5e1;
     }
 
+    /* ===== 絞り込みフィルターセクション (Faceted Filters) ===== */
+    .filter-section {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      padding: 0.85rem 1.15rem;
+      margin-bottom: 1.25rem;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+      transition: var(--transition);
+    }
+
+    .filter-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .filter-title-group {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .filter-icon {
+      font-size: 1rem;
+    }
+
+    .filter-title {
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .filter-active-badge {
+      background: var(--primary);
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.15rem 0.55rem;
+      border-radius: 9999px;
+    }
+
+    .filter-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .filter-clear-btn {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+      font-size: 0.75rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    .filter-clear-btn:hover {
+      background: rgba(239, 68, 68, 0.25);
+      border-color: var(--accent-red);
+      color: #fff;
+    }
+
+    .filter-toggle-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 0.8rem;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      transition: var(--transition);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .filter-toggle-btn:hover {
+      color: var(--text-main);
+      background: var(--bg-card-hover);
+    }
+
+    .filter-body {
+      margin-top: 0.85rem;
+      padding-top: 0.85rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+    }
+
+    .filter-body.collapsed {
+      display: none;
+    }
+
+    .facet-group {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      font-size: 0.82rem;
+    }
+
+    .facet-label {
+      flex: 0 0 75px;
+      color: var(--text-muted);
+      font-weight: 600;
+      padding-top: 0.2rem;
+      white-space: nowrap;
+    }
+
+    .facet-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      flex: 1;
+    }
+
+    .facet-pill {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-color);
+      border-radius: 9999px;
+      color: var(--text-muted);
+      padding: 0.22rem 0.6rem;
+      font-size: 0.78rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      transition: var(--transition);
+      user-select: none;
+    }
+
+    .facet-pill:hover {
+      background: var(--bg-card-hover);
+      border-color: rgba(255, 255, 255, 0.2);
+      color: var(--text-main);
+    }
+
+    .facet-pill.active {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+      font-weight: 500;
+      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.35);
+    }
+
+    .facet-pill.active .facet-count {
+      background: rgba(0, 0, 0, 0.25);
+      color: #fff;
+    }
+
+    .facet-count {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-sub);
+      font-size: 0.7rem;
+      padding: 0.05rem 0.35rem;
+      border-radius: 9999px;
+      line-height: 1.2;
+    }
+
+    .facet-expand-btn {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px dashed var(--border-color);
+      border-radius: 9999px;
+      color: var(--text-sub);
+      padding: 0.22rem 0.65rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: var(--transition);
+      user-select: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+
+    .facet-expand-btn:hover {
+      background: rgba(99, 102, 241, 0.12);
+      color: #a5b4fc;
+      border-color: var(--primary);
+    }
+
+    .facet-expand-btn.expanded {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-muted);
+      border-style: solid;
+    }
+
     .meta-bar {
       display: flex;
       justify-content: space-between;
@@ -1831,6 +2109,38 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       margin-bottom: 1.25rem;
       font-size: 0.9rem;
       color: var(--text-muted);
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .limit-warning-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #fbbf24;
+      font-size: 0.78rem;
+      padding: 0.2rem 0.65rem;
+      border-radius: 9999px;
+      margin-left: 0.5rem;
+    }
+
+    .btn-lift-limit {
+      background: #f59e0b;
+      border: none;
+      color: #000;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.15rem 0.55rem;
+      border-radius: 9999px;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    .btn-lift-limit:hover {
+      background: #fbbf24;
+      transform: scale(1.04);
     }
 
     .grid {
@@ -1973,6 +2283,26 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     .card-series:hover {
       text-decoration: underline;
+    }
+
+    .card-library {
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      color: #a5b4fc;
+      font-size: 0.72rem;
+      padding: 0.08rem 0.4rem;
+      border-radius: 4px;
+      font-weight: 500;
+      white-space: nowrap;
+      display: inline-block;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    .card-library:hover {
+      background: rgba(99, 102, 241, 0.28);
+      border-color: var(--primary);
+      color: #fff;
     }
 
     .card-studio {
@@ -2859,7 +3189,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       <div class="controls-wrapper">
         <div class="search-bar">
           <span class="search-icon">🔍</span>
-          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・エピソード・出演者・タグ等 (空欄で全件)" title="検索のヒント: series:シリーズ名, actor:出演者, genre:ジャンル, studio:スタジオ, tag:タグ, item:動画名。-tag:ホラー でNOT除外、スペース区切りでAND検索も可能" autocomplete="off">
+          <input type="text" id="searchInput" class="search-input" placeholder="シリーズ・出演者・タグ・ライブラリ等 (空欄で全件)" title="検索のヒント: lib:ライブラリ, series:シリーズ名, actor:出演者, genre:ジャンル, studio:スタジオ, tag:タグ, item:動画名。-lib:GAME でNOT除外、スペース区切りでAND検索も可能" autocomplete="off">
           <button id="clearBtn" class="clear-btn" title="クリア">✕</button>
         </div>
 
@@ -2929,8 +3259,31 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- 絞り込みフィルターバー (Faceted Filters) -->
+    <div id="filterSection" class="filter-section" style="display: none;">
+      <div class="filter-header" id="filterHeader">
+        <div class="filter-title-group">
+          <span class="filter-icon">🎯</span>
+          <span class="filter-title">絞り込みフィルター</span>
+          <span id="activeFilterBadge" class="filter-active-badge" style="display: none;">0 件適用中</span>
+        </div>
+        <div class="filter-actions">
+          <button type="button" id="clearFiltersBtn" class="filter-clear-btn" style="display: none;">✕ フィルター全解除</button>
+          <button type="button" id="toggleFilterBodyBtn" class="filter-toggle-btn" title="開閉">
+            <span id="filterToggleIcon">▲</span>
+          </button>
+        </div>
+      </div>
+      <div id="filterBody" class="filter-body">
+        <!-- 動的にファセットが挿入されます -->
+      </div>
+    </div>
+
     <div class="meta-bar">
-      <span id="resultCount">読み込み中...</span>
+      <div style="display: flex; align-items: center; flex-wrap: wrap;">
+        <span id="resultCount">読み込み中...</span>
+        <span id="limitWarningBadge" class="limit-warning-badge" style="display: none;"></span>
+      </div>
       <span id="currentFilter"></span>
     </div>
 
@@ -3130,6 +3483,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const clearPlaylistBtn = document.getElementById('clearPlaylistBtn');
     const videoGrid = document.getElementById('videoGrid');
     const resultCount = document.getElementById('resultCount');
+    const limitWarningBadge = document.getElementById('limitWarningBadge');
     const brandBtn = document.getElementById('brandBtn');
     const serverStatus = document.getElementById('serverStatus');
     const statusDot = document.getElementById('statusDot');
@@ -3251,6 +3605,15 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const nowPlayingJellyfinLink = document.getElementById('nowPlayingJellyfinLink');
     const nowPlayingCloseBtn = document.getElementById('nowPlayingCloseBtn');
 
+    // 絞り込みフィルター要素
+    const filterSection = document.getElementById('filterSection');
+    const filterHeader = document.getElementById('filterHeader');
+    const filterBody = document.getElementById('filterBody');
+    const activeFilterBadge = document.getElementById('activeFilterBadge');
+    const clearFiltersBtn = document.getElementById('clearFiltersBtn');
+    const toggleFilterBodyBtn = document.getElementById('toggleFilterBodyBtn');
+    const filterToggleIcon = document.getElementById('filterToggleIcon');
+
     const PAGE_LIMIT = 40;
     let currentStartIndex = 0;
     let totalItems = 0;
@@ -3261,6 +3624,22 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     let currentSort = 'premiere_desc';
     let debounceTimer = null;
     let observer = null;
+
+    // 検索モード (In-memory filtering) 状態管理
+    let isSearchMode = false;
+    let searchAllItems = [];
+    let clientFilteredItems = [];
+    let clientRenderedCount = 0;
+    let isFilterCollapsed = false;
+    const activeFilters = {
+      libraries: new Set(),
+      types: new Set(),
+      years: new Set(),
+      genres: new Set(),
+      tags: new Set(),
+      actors: new Set()
+    };
+    const expandedFacetGroups = new Set();
 
     // 現在画面に表示されているアイテムのキャッシュ (Id -> Item)
     const itemsCache = new Map();
@@ -3305,12 +3684,359 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       }
     }
 
+    // ===== 絞り込みフィルター (Faceted Filters) 関連関数 =====
+    function toggleFilterCollapse() {
+      isFilterCollapsed = !isFilterCollapsed;
+      if (isFilterCollapsed) {
+        filterBody.classList.add('collapsed');
+        if (filterToggleIcon) filterToggleIcon.textContent = '▼';
+      } else {
+        filterBody.classList.remove('collapsed');
+        if (filterToggleIcon) filterToggleIcon.textContent = '▲';
+      }
+    }
+
+    if (filterHeader) {
+      filterHeader.addEventListener('click', (e) => {
+        if (e.target.closest('#clearFiltersBtn') || e.target.closest('.facet-expand-btn')) return;
+        toggleFilterCollapse();
+      });
+    }
+
+    function clearAllActiveFilters(apply = true) {
+      activeFilters.libraries.clear();
+      activeFilters.types.clear();
+      activeFilters.years.clear();
+      activeFilters.genres.clear();
+      activeFilters.tags.clear();
+      activeFilters.actors.clear();
+      if (apply) {
+        applyClientFilters();
+      }
+    }
+
+    if (clearFiltersBtn) {
+      clearFiltersBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        clearAllActiveFilters(true);
+      });
+    }
+
+    function buildFilterFacets(items) {
+      const libraryCounts = new Map();
+      const typeCounts = new Map();
+      const yearCounts = new Map();
+      const genreCounts = new Map();
+      const tagCounts = new Map();
+      const actorCounts = new Map();
+
+      items.forEach(item => {
+        // Library
+        if (item.library_name) {
+          libraryCounts.set(item.library_name, (libraryCounts.get(item.library_name) || 0) + 1);
+        }
+        // Type
+        if (item.type) {
+          typeCounts.set(item.type, (typeCounts.get(item.type) || 0) + 1);
+        }
+        // Year
+        const y = item.year || (item.premiere_date ? item.premiere_date.slice(0, 4) : null);
+        if (y) {
+          yearCounts.set(String(y), (yearCounts.get(String(y)) || 0) + 1);
+        }
+        // Genres
+        (item.genres || []).forEach(g => {
+          if (g) genreCounts.set(g, (genreCounts.get(g) || 0) + 1);
+        });
+        // Tags
+        (item.tags || []).forEach(t => {
+          if (t) tagCounts.set(t, (tagCounts.get(t) || 0) + 1);
+        });
+        // Actors
+        (item.actors || []).forEach(a => {
+          const name = (typeof a === 'object' && a !== null) ? a.name : String(a);
+          if (name) actorCounts.set(name, (actorCounts.get(name) || 0) + 1);
+        });
+      });
+
+      let html = '';
+
+      function createFacetRow(categoryKey, labelText, countMap, sortMode = 'count', initialLimit = 8, maxTotal = 40) {
+        if (countMap.size === 0) return '';
+        let entries = Array.from(countMap.entries());
+        if (sortMode === 'year') {
+          entries.sort((a, b) => b[0].localeCompare(a[0]));
+        } else {
+          entries.sort((a, b) => b[1] - a[1]);
+        }
+        entries = entries.slice(0, maxTotal);
+
+        const isOverLimit = entries.length > initialLimit;
+        // 隠れている部分にActiveなピルがあれば自動展開
+        const hasActiveHidden = isOverLimit && entries.slice(initialLimit).some(([val]) => activeFilters[categoryKey].has(val));
+        const isExpanded = expandedFacetGroups.has(categoryKey) || hasActiveHidden;
+
+        const visibleEntries = (isOverLimit && !isExpanded) ? entries.slice(0, initialLimit) : entries;
+        const hiddenCount = entries.length - initialLimit;
+
+        const pillsHtml = visibleEntries.map(([val, cnt]) => {
+          const isActive = activeFilters[categoryKey].has(val);
+          const activeCls = isActive ? ' active' : '';
+          return `<button type="button" class="facet-pill${activeCls}" data-category="${categoryKey}" data-val="${escapeHtml(val)}" title="${escapeHtml(val)} (${cnt}件)">${escapeHtml(val)}<span class="facet-count">${cnt}</span></button>`;
+        }).join('');
+
+        let expandBtnHtml = '';
+        if (isOverLimit) {
+          if (isExpanded) {
+            expandBtnHtml = `<button type="button" class="facet-expand-btn expanded" data-action="collapse" data-category="${categoryKey}">▲ 閉じる</button>`;
+          } else {
+            expandBtnHtml = `<button type="button" class="facet-expand-btn" data-action="expand" data-category="${categoryKey}">+ 他 ${hiddenCount} 件</button>`;
+          }
+        }
+
+        return `
+          <div class="facet-group">
+            <div class="facet-label">${labelText}</div>
+            <div class="facet-pills">${pillsHtml}${expandBtnHtml}</div>
+          </div>
+        `;
+      }
+
+      if (libraryCounts.size > 0) {
+        html += createFacetRow('libraries', '📚 ライブラリ', libraryCounts, 'count', 8, 20);
+      }
+      if (typeCounts.size > 1) {
+        html += createFacetRow('types', '📁 種別', typeCounts, 'count', 6, 10);
+      }
+      if (yearCounts.size > 1) {
+        html += createFacetRow('years', '📅 年代', yearCounts, 'year', 8, 25);
+      }
+      if (genreCounts.size > 0) {
+        html += createFacetRow('genres', '🎭 ジャンル', genreCounts, 'count', 8, 30);
+      }
+      if (tagCounts.size > 0) {
+        html += createFacetRow('tags', '🏷️ タグ', tagCounts, 'count', 8, 40);
+      }
+      if (actorCounts.size > 0) {
+        html += createFacetRow('actors', '👤 出演者', actorCounts, 'count', 6, 40);
+      }
+
+      filterBody.innerHTML = html;
+    }
+
+    if (filterBody) {
+      filterBody.addEventListener('click', (e) => {
+        // 折りたたみ・展開ボタンのクリック
+        const expandBtn = e.target.closest('.facet-expand-btn');
+        if (expandBtn) {
+          e.stopPropagation();
+          const cat = expandBtn.getAttribute('data-category');
+          const action = expandBtn.getAttribute('data-action');
+          if (action === 'expand') {
+            expandedFacetGroups.add(cat);
+          } else {
+            expandedFacetGroups.delete(cat);
+          }
+          buildFilterFacets(searchAllItems);
+          return;
+        }
+
+        // ピルボタンのクリック
+        const pill = e.target.closest('.facet-pill');
+        if (!pill) return;
+        const category = pill.getAttribute('data-category');
+        const val = pill.getAttribute('data-val');
+        if (!category || !val || !activeFilters[category]) return;
+
+        if (activeFilters[category].has(val)) {
+          activeFilters[category].delete(val);
+        } else {
+          activeFilters[category].add(val);
+        }
+
+        applyClientFilters();
+      });
+    }
+
+    function applyClientFilters() {
+      const hasLibrary = activeFilters.libraries.size > 0;
+      const hasType = activeFilters.types.size > 0;
+      const hasYear = activeFilters.years.size > 0;
+      const hasGenre = activeFilters.genres.size > 0;
+      const hasTag = activeFilters.tags.size > 0;
+      const hasActor = activeFilters.actors.size > 0;
+
+      const totalActive = activeFilters.libraries.size + activeFilters.types.size + activeFilters.years.size + activeFilters.genres.size + activeFilters.tags.size + activeFilters.actors.size;
+
+      if (totalActive > 0) {
+        activeFilterBadge.textContent = `${totalActive} 件適用中`;
+        activeFilterBadge.style.display = 'inline-block';
+        clearFiltersBtn.style.display = 'inline-block';
+      } else {
+        activeFilterBadge.style.display = 'none';
+        clearFiltersBtn.style.display = 'none';
+      }
+
+      // ピルの選択状態を同期
+      filterBody.querySelectorAll('.facet-pill').forEach(pill => {
+        const cat = pill.getAttribute('data-category');
+        const v = pill.getAttribute('data-val');
+        if (activeFilters[cat] && activeFilters[cat].has(v)) {
+          pill.classList.add('active');
+        } else {
+          pill.classList.remove('active');
+        }
+      });
+
+      // フィルタリング (同一カテゴリ内はOR、カテゴリ間はAND)
+      clientFilteredItems = searchAllItems.filter(item => {
+        if (hasLibrary && !activeFilters.libraries.has(item.library_name)) return false;
+        if (hasType && !activeFilters.types.has(item.type)) return false;
+        if (hasYear) {
+          const y = String(item.year || (item.premiere_date ? item.premiere_date.slice(0, 4) : ''));
+          if (!activeFilters.years.has(y)) return false;
+        }
+        if (hasGenre) {
+          const gList = item.genres || [];
+          const match = Array.from(activeFilters.genres).some(g => gList.includes(g));
+          if (!match) return false;
+        }
+        if (hasTag) {
+          const tList = item.tags || [];
+          const match = Array.from(activeFilters.tags).some(t => tList.includes(t));
+          if (!match) return false;
+        }
+        if (hasActor) {
+          const aList = (item.actors || []).map(a => typeof a === 'object' && a !== null ? a.name : String(a));
+          const match = Array.from(activeFilters.actors).some(act => aList.includes(act));
+          if (!match) return false;
+        }
+        return true;
+      });
+
+      // 先頭40件を描画
+      clientRenderedCount = Math.min(PAGE_LIMIT, clientFilteredItems.length);
+      renderVideos(clientFilteredItems.slice(0, clientRenderedCount), false);
+
+      hasMore = clientRenderedCount < clientFilteredItems.length;
+
+      updateClientMetaBar();
+
+      if (hasMore) {
+        scrollLoader.style.display = 'flex';
+        scrollLoader.innerHTML = '<span class="spinner"></span> 下にスクロールしてさらに読み込み...';
+      } else {
+        scrollLoader.style.display = clientRenderedCount > 0 ? 'flex' : 'none';
+        scrollLoader.innerHTML = `✓ 絞り込み結果 全 ${clientFilteredItems.length.toLocaleString()} 件を表示中`;
+      }
+    }
+
+    function loadMoreClientItems() {
+      if (isLoading || !hasMore) return;
+      const nextChunk = clientFilteredItems.slice(clientRenderedCount, clientRenderedCount + PAGE_LIMIT);
+      if (nextChunk.length === 0) {
+        hasMore = false;
+        scrollLoader.innerHTML = `✓ 絞り込み結果 全 ${clientFilteredItems.length.toLocaleString()} 件を表示中`;
+        return;
+      }
+      clientRenderedCount += nextChunk.length;
+      renderVideos(nextChunk, true);
+      hasMore = clientRenderedCount < clientFilteredItems.length;
+      updateClientMetaBar();
+
+      if (!hasMore) {
+        scrollLoader.innerHTML = `✓ 絞り込み結果 全 ${clientFilteredItems.length.toLocaleString()} 件を表示中`;
+      }
+    }
+
     async function fetchVideos(query, sort, startIndex, append = false) {
       if (isLoading) return;
       isLoading = true;
 
-      if (!append) {
+      // 検索クエリがある場合: サーバーから全件一括取得してクライアント側でフィルタリング
+      if (query) {
+        isSearchMode = true;
         resultCount.innerHTML = '<span class="spinner"></span> 検索中...';
+        scrollLoader.style.display = 'none';
+        itemsCache.clear();
+
+        try {
+          const params = new URLSearchParams({
+            q: query,
+            limit: 0,
+            sort: sort
+          });
+          const res = await fetch(`/api/search?${params.toString()}`);
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            if (res.status === 401) {
+              apiKeyAlert.classList.add('active');
+              videoGrid.innerHTML = `
+                <div class="empty-state">
+                  <div class="empty-icon">🔑</div>
+                  <h3>APIキーの設定が必要です</h3>
+                  <p>JellyfinダッシュボードからAPIキーを発行し、.envに設定してください。</p>
+                </div>`;
+              resultCount.textContent = '0 件';
+              scrollLoader.style.display = 'none';
+              filterSection.style.display = 'none';
+              return;
+            }
+            throw new Error(err.detail || '取得に失敗しました');
+          }
+
+          const data = await res.json();
+          searchAllItems = data.items || [];
+          totalItems = searchAllItems.length;
+          searchAllItems.forEach(it => itemsCache.set(it.id, it));
+
+          // 上限到達通知の制御
+          if (data.hit_limit && limitWarningBadge) {
+            const fLimit = data.fetch_limit || 2000;
+            limitWarningBadge.innerHTML = `⚠️ 取得上限 (${fLimit.toLocaleString()}件) に達しました <button type="button" class="btn-lift-limit" id="liftLimitBtn">上限解除 (全件取得)</button>`;
+            limitWarningBadge.style.display = 'inline-flex';
+          } else if (limitWarningBadge) {
+            limitWarningBadge.style.display = 'none';
+          }
+
+          // フィルターを構築
+          clearAllActiveFilters(false);
+          buildFilterFacets(searchAllItems);
+
+          if (searchAllItems.length > 0) {
+            filterSection.style.display = 'block';
+          } else {
+            filterSection.style.display = 'none';
+          }
+
+          applyClientFilters();
+
+        } catch (err) {
+          if (limitWarningBadge) limitWarningBadge.style.display = 'none';
+          filterSection.style.display = 'none';
+          videoGrid.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">⚠️</div>
+              <h3>エラーが発生しました</h3>
+              <p>${escapeHtml(err.message)}</p>
+            </div>`;
+          resultCount.textContent = 'エラー';
+          scrollLoader.style.display = 'none';
+        } finally {
+          isLoading = false;
+        }
+        return;
+      }
+
+      // クエリ未指定（全件一覧ブラウズ時）: サーバーサイドページネーション
+      isSearchMode = false;
+      searchAllItems = [];
+      filterSection.style.display = 'none';
+      if (limitWarningBadge) limitWarningBadge.style.display = 'none';
+      clearAllActiveFilters(false);
+
+      if (!append) {
+        resultCount.innerHTML = '<span class="spinner"></span> 読み込み中...';
         scrollLoader.style.display = 'none';
         itemsCache.clear();
       } else {
@@ -3324,9 +4050,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           startIndex: startIndex,
           sort: sort,
         });
-        if (query) {
-          params.append('q', query);
-        }
 
         const res = await fetch(`/api/search?${params.toString()}`);
         if (!res.ok) {
@@ -3400,6 +4123,20 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       }
     }
 
+    function updateClientMetaBar() {
+      const queryStr = currentQuery ? ` (検索: "${currentQuery}")` : '';
+      const totalActive = activeFilters.libraries.size + activeFilters.types.size + activeFilters.years.size + activeFilters.genres.size + activeFilters.tags.size + activeFilters.actors.size;
+      const isFiltered = totalActive > 0;
+      
+      if (searchAllItems.length === 0) {
+        resultCount.textContent = '0 件';
+      } else if (isFiltered) {
+        resultCount.innerHTML = `<strong>${clientRenderedCount.toLocaleString()}</strong> / <strong>${clientFilteredItems.length.toLocaleString()}</strong> 件表示中 (全 ${searchAllItems.length.toLocaleString()} 件から絞り込み中)${queryStr}`;
+      } else {
+        resultCount.textContent = `${clientRenderedCount.toLocaleString()} / ${searchAllItems.length.toLocaleString()} 件表示中${queryStr}`;
+      }
+    }
+
     function renderVideos(items, append) {
       if (!append && items.length === 0) {
         videoGrid.innerHTML = `
@@ -3422,6 +4159,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     function createCardHtml(item) {
       const thumbUrl = `/api/image/${item.id}`;
+      const libraryHtml = item.library_name
+        ? `<span class="card-library" data-library="${escapeHtml(item.library_name)}" title="このライブラリで検索: lib:${escapeHtml(item.library_name)}">📚 ${escapeHtml(item.library_name)}</span>`
+        : '';
       const seriesHtml = item.series_name 
         ? `<span class="card-series" data-series="${escapeHtml(item.series_name)}" title="このシリーズで検索">${escapeHtml(item.series_name)}</span>` 
         : '';
@@ -3500,6 +4240,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <div class="card-body">
             <div class="card-meta-line">
               <div style="display:flex; align-items:center; gap:0.4rem; overflow:hidden;">
+                ${libraryHtml}
                 ${seriesHtml}
                 ${studioHtml}
               </div>
@@ -3865,6 +4606,21 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         return `${prefix}:${trimmed}`;
       }
 
+      // ライブラリ名クリックによる絞り込み検索
+      const libraryEl = e.target.closest('.card-library');
+      if (libraryEl) {
+        const libName = libraryEl.getAttribute('data-library');
+        if (libName) {
+          const qVal = formatPrefixQuery('lib', libName);
+          searchInput.value = qVal;
+          clearBtn.style.display = 'block';
+          currentQuery = qVal;
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          resetAndReload();
+          return;
+        }
+      }
+
       // シリーズ名クリックによる絞り込み検索
       const seriesEl = e.target.closest('.card-series');
       if (seriesEl) {
@@ -4006,8 +4762,26 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     clearBtn.addEventListener('click', () => {
       searchInput.value = '';
       clearBtn.style.display = 'none';
+      if (limitWarningBadge) limitWarningBadge.style.display = 'none';
       currentQuery = '';
       resetAndReload();
+    });
+
+    document.addEventListener('click', (e) => {
+      const liftBtn = e.target.closest('#liftLimitBtn');
+      if (liftBtn) {
+        let qVal = searchInput.value.trim();
+        if (/limit:\S+/i.test(qVal)) {
+          qVal = qVal.replace(/limit:\S+/i, 'limit:all');
+        } else {
+          qVal = qVal ? `${qVal} limit:all` : 'limit:all';
+        }
+        searchInput.value = qVal;
+        clearBtn.style.display = 'block';
+        currentQuery = qVal;
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        resetAndReload();
+      }
     });
 
     sortSelect.addEventListener('change', (e) => {
@@ -4018,7 +4792,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     // 無限スクロールの監視 (IntersectionObserver)
     observer = new IntersectionObserver((entries) => {
       if (entries[0].isIntersecting && hasMore && !isLoading) {
-        fetchVideos(currentQuery, currentSort, currentStartIndex, true);
+        if (isSearchMode) {
+          loadMoreClientItems();
+        } else {
+          fetchVideos(currentQuery, currentSort, currentStartIndex, true);
+        }
       }
     }, {
       rootMargin: '300px 0px',
